@@ -1,0 +1,61 @@
+# deriver's own, isolated pyproject.toml — see the root pyproject.toml header
+# comment for why this file exists separately (TZ 4/5.1/5.8-T4: deriver must
+# never be able to import a network library, and a separate installable
+# package makes that mechanical rather than a matter of discipline).
+#
+# THIS LIST MUST STAY EXACTLY {bip-utils, coincurve, pydantic}. Do not add
+# httpx, aiohttp, web3, redis, celery, aiogram, or fastapi here under any
+# circumstance — that would silently defeat the isolation this package exists
+# for. If deriver ever needs a piece of a shared schema/config from core/, add
+# a small trimmed copy of just that piece here rather than depending on core/
+# (which pulls in sqlalchemy/pydantic-adjacent stack that's fine, but core/
+# itself must stay free to grow network-adjacent helpers later without ever
+# becoming an accidental deriver dependency).
+#
+# Versions verified against PyPI's JSON API on 2026-08-15.
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "notchstave-deriver"
+version = "0.1.0"
+description = "Notchstave deriver — holds the account xpub in memory, derives BIP-32/44 addresses. No network dependencies, by design."
+requires-python = ">=3.12"
+dependencies = [
+    "bip-utils==2.12.2",
+    "coincurve==21.0.0",
+    "pydantic==2.13.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff==0.16.3",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+]
+
+# pyproject.toml is co-located with the package's own __init__.py/main.py
+# (flat layout, matching the other five process packages) rather than a
+# src/deriver/ nested layout — package-dir maps the "deriver" import name
+# straight onto this same directory.
+[tool.setuptools]
+packages = ["deriver"]
+
+[tool.setuptools.package-dir]
+deriver = "."
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

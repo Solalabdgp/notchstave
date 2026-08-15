@@ -1,0 +1,77 @@
+# Notchstave — root workspace pyproject.
+#
+# Why two pyproject.toml files instead of one (architect's call, per TZ 4/5.1/
+# 5.8-T4): deriver is the one package in this repo that must never gain a
+# network-library dependency — that isolation is the whole point of the
+# threat model (T4: xpub leak). Putting every dependency in a single root
+# list relies on humans remembering not to add web3/aiogram/etc under
+# deriver's import path. Splitting deriver into its own installable package
+# with its OWN pyproject.toml (deriver/pyproject.toml) makes the isolation
+# mechanical instead of social: `pip install -e ./deriver` (or `uv sync`
+# inside deriver/) physically cannot resolve web3/aiogram/fastapi/redis/
+# celery, because they are not declared there and that file has no reference
+# to this one. A CI step can later diff deriver/pyproject.toml's dependency
+# list against an allowlist of exactly {bip-utils, coincurve, pydantic} and
+# fail the build the moment that changes.
+#
+# This root file covers bot / api / watcher / settler / notifier / core — the
+# five process boundaries plus the shared DB-models/config package (core/) —
+# which are safe to share a dependency set because none of them are the
+# component holding key material.
+#
+# All versions below were verified against PyPI's JSON API on 2026-08-15
+# (see the delivery report for exact source per package); do not bump from
+# memory.
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "notchstave"
+version = "0.1.0"
+description = "Telegram crypto-payment bot that never holds private keys — bot/api/watcher/settler/notifier + shared core. Portfolio project, Week 1 skeleton."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram==3.30.0",
+    "fastapi==0.141.1",
+    "sqlalchemy==2.0.52",
+    "alembic==1.19.1",
+    "redis==8.1.0",
+    "celery==5.6.3",
+    "web3==7.16.0",
+    "pydantic==2.13.4",
+    "prometheus-client==0.26.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff==0.16.3",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+]
+
+[tool.setuptools]
+packages = ["bot", "api", "watcher", "settler", "notifier", "core"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# deriver is linted via its own pyproject.toml / own ruff invocation, not this
+# one, so that a root-wide `ruff check .` config change can never accidentally
+# license a network import inside deriver/ by config drift.
+extend-exclude = ["deriver", "migrations/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+# deriver has its own isolated environment (see deriver/pyproject.toml) and is
+# type-checked separately for the same reason it is dependency-isolated.
+exclude = ["deriver/", "migrations/versions/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
