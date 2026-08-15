@@ -5,7 +5,8 @@ migration 0001). Native types are used on purpose: a typo in a status string
 must fail at the database boundary, not silently write garbage into a money
 table.
 
-`str, Enum` (not `StrEnum`) so the module also imports on Python 3.10 tooling.
+Values are what reaches the database; `StrEnum` keeps `str(x)` equal to that
+value so a stray f-string cannot write `InvoiceStatus.PAID` into a money column.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ __all__ = [
 ]
 
 
-class BlockStatus(str, enum.Enum):
+class BlockStatus(enum.StrEnum):
     """`blocks.status` — chain-of-blocks bookkeeping for reorg handling (TZ 5.4)."""
 
     PENDING = "pending"
@@ -36,7 +37,7 @@ class BlockStatus(str, enum.Enum):
     ORPHANED = "orphaned"
 
 
-class AddressStatus(str, enum.Enum):
+class AddressStatus(enum.StrEnum):
     """`receive_addresses.status` (TZ 5.1, gap-limit / reuse pool).
 
     free     — in the pool, may be handed to the next invoice
@@ -51,7 +52,7 @@ class AddressStatus(str, enum.Enum):
     SWEPT = "swept"
 
 
-class InvoiceStatus(str, enum.Enum):
+class InvoiceStatus(enum.StrEnum):
     """`invoices.status` — the payment state machine (TZ 6)."""
 
     AWAITING = "awaiting"
@@ -79,7 +80,7 @@ LIVE_INVOICE_STATUSES = (
 CREDITABLE_PAYMENT_STATUSES = ("confirmed", "credited")
 
 
-class PaymentStatus(str, enum.Enum):
+class PaymentStatus(enum.StrEnum):
     """`payments.status` (TZ 6)."""
 
     SEEN = "seen"
@@ -89,7 +90,7 @@ class PaymentStatus(str, enum.Enum):
     IGNORED_DUST = "ignored_dust"
 
 
-class PaymentAnomaly(str, enum.Enum):
+class PaymentAnomaly(enum.StrEnum):
     """`payments.anomaly` — NULL means "nothing unusual" (TZ 5.5)."""
 
     WRONG_ASSET = "wrong_asset"
@@ -100,12 +101,12 @@ class PaymentAnomaly(str, enum.Enum):
     UNASSIGNED_PAYMENT = "unassigned_payment"
 
 
-class ProductKind(str, enum.Enum):
+class ProductKind(enum.StrEnum):
     ONE_OFF = "one_off"
     SUBSCRIPTION = "subscription"
 
 
-class RefundStatus(str, enum.Enum):
+class RefundStatus(enum.StrEnum):
     """`refunds.status`.
 
     A refund row is an accounting obligation, not an instruction to send money.
@@ -117,7 +118,7 @@ class RefundStatus(str, enum.Enum):
     DECLINED = "declined"
 
 
-class ManualReviewKind(str, enum.Enum):
+class ManualReviewKind(enum.StrEnum):
     """Why a human was pulled in (TZ 5.5 anomaly table + 5.8/T1, T3)."""
 
     UNDERPAID = "underpaid"
@@ -132,7 +133,7 @@ class ManualReviewKind(str, enum.Enum):
     RECONCILE_DRIFT = "reconcile_drift"
 
 
-class ManualReviewResolution(str, enum.Enum):
+class ManualReviewResolution(enum.StrEnum):
     """Outcome of `/resolve <invoice_id> <credit|refund|reject>` (TZ 3.4)."""
 
     CREDIT = "credit"
@@ -140,7 +141,7 @@ class ManualReviewResolution(str, enum.Enum):
     REJECT = "reject"
 
 
-class NotificationStatus(str, enum.Enum):
+class NotificationStatus(enum.StrEnum):
     """Transactional-outbox row state (TZ 5.7 / 5.8-T2.5)."""
 
     QUEUED = "queued"
@@ -149,7 +150,7 @@ class NotificationStatus(str, enum.Enum):
     DEAD = "dead"  # exhausted retries -> DLQ, needs a human
 
 
-class ActorKind(str, enum.Enum):
+class ActorKind(enum.StrEnum):
     """`audit_log.actor_kind` (TZ 5.8/T7, T8)."""
 
     OWNER = "owner"

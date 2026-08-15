@@ -25,7 +25,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy import (
@@ -42,20 +42,21 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, BYTEA, JSONB, UUID as PgUUID
+from sqlalchemy.dialects.postgresql import ARRAY, BYTEA, JSONB
+from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.db import enums as E
 from core.db.base import (
     AMOUNT_RAW,
     BIP32_PATH_PREFIX_RE,
-    Base,
     EVM_ADDRESS_RE,
     FINGERPRINT_RE,
     PRICE_USD,
     RATE,
     TX_HASH_RE,
     USD_AMOUNT,
+    Base,
 )
 
 __all__ = [
@@ -278,22 +279,22 @@ class ReceiveAddress(Base):
         nullable=False,
         server_default=sa.text("'free'"),
     )
-    current_invoice_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    current_invoice_id: Mapped[uuid.UUID | None] = mapped_column(
         PgUUID(as_uuid=True),
         ForeignKey("invoices.id", ondelete="RESTRICT", use_alter=True),
         nullable=True,
     )
-    reserved_from_block: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    cooldown_until: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
+    reserved_from_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    cooldown_until: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
     ever_funded: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=sa.text("false")
     )
-    first_seen_funds_at: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
-    swept_at: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
+    first_seen_funds_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
+    swept_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
 
     hd_account: Mapped[HDAccount] = relationship("HDAccount", lazy="raise")
-    current_invoice: Mapped[Optional["Invoice"]] = relationship(
+    current_invoice: Mapped[Invoice | None] = relationship(
         "Invoice",
         foreign_keys=[current_invoice_id],
         post_update=True,
@@ -363,7 +364,7 @@ class Asset(Base):
         BigInteger, ForeignKey("chains.chain_id", ondelete="RESTRICT"), nullable=False
     )
     #: NULL for the native coin, contract address otherwise.
-    contract_address: Mapped[Optional[str]] = mapped_column(String(42), nullable=True)
+    contract_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
     symbol: Mapped[str] = mapped_column(String(16), nullable=False)
     decimals: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     is_native: Mapped[bool] = mapped_column(
@@ -409,11 +410,13 @@ class Product(Base):
     sku: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     price_usd: Mapped[Decimal] = mapped_column(PRICE_USD, nullable=False)
-    kind: Mapped[E.ProductKind] = mapped_column(_enum(E.ProductKind, "product_kind"), nullable=False)
+    kind: Mapped[E.ProductKind] = mapped_column(
+        _enum(E.ProductKind, "product_kind"), nullable=False
+    )
     #: File id / URL / whatever the delivery layer resolves.
     content_ref: Mapped[str] = mapped_column(Text, nullable=False)
     #: Only for `subscription`: entitlement lifetime in days.
-    subscription_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    subscription_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa.text("true"))
     created_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
 
@@ -448,7 +451,7 @@ class User(Base):
         JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
     )
     #: Set when Telegram reports the bot was blocked; notifier stops sending (TZ 5.7).
-    bot_blocked_at: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
+    bot_blocked_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
 
     __table_args__ = (
@@ -505,7 +508,7 @@ class Invoice(Base):
     #: Late top-ups are still credited until this moment (TZ 5.5 underpayment).
     topup_window_until: Mapped[dt.datetime] = mapped_column(TS, nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
-    settled_at: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
+    settled_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
     #: HMAC-SHA256 over (id, chain_id, asset_id, address, amount_due_raw,
     #: expires_at). The key lives in systemd credentials, never in this database
     #: (TZ 5.8/T1.3).
@@ -518,7 +521,7 @@ class Invoice(Base):
     address: Mapped[ReceiveAddress] = relationship(
         "ReceiveAddress", foreign_keys=[address_id], lazy="raise"
     )
-    payments: Mapped[list["Payment"]] = relationship(
+    payments: Mapped[list[Payment]] = relationship(
         "Payment", back_populates="invoice", lazy="raise"
     )
 
@@ -556,7 +559,10 @@ class Invoice(Base):
         CheckConstraint("rate_snapshot > 0", name="rate_snapshot_positive"),
         CheckConstraint("topup_window_until >= expires_at", name="topup_window_after_expiry"),
         CheckConstraint("expires_at > created_at", name="expiry_after_creation"),
-        CheckConstraint("settled_at IS NULL OR settled_at >= created_at", name="settled_after_creation"),
+        CheckConstraint(
+            "settled_at IS NULL OR settled_at >= created_at",
+            name="settled_after_creation",
+        ),
         CheckConstraint("octet_length(integrity_mac) = 32", name="integrity_mac_length"),
         {
             "comment": (
@@ -593,7 +599,7 @@ class Payment(Base):
     address_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("receive_addresses.id", ondelete="RESTRICT"), nullable=False
     )
-    invoice_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    invoice_id: Mapped[uuid.UUID | None] = mapped_column(
         PgUUID(as_uuid=True),
         ForeignKey("invoices.id", ondelete="RESTRICT"),
         nullable=True,
@@ -601,19 +607,19 @@ class Payment(Base):
     asset_id: Mapped[int] = mapped_column(Integer, nullable=False)
     amount_raw: Mapped[Decimal] = mapped_column(AMOUNT_RAW, nullable=False)
     #: Informational only — never a safe refund destination (TZ 5.5).
-    sender: Mapped[Optional[str]] = mapped_column(String(42), nullable=True)
+    sender: Mapped[str | None] = mapped_column(String(42), nullable=True)
     status: Mapped[E.PaymentStatus] = mapped_column(
         _enum(E.PaymentStatus, "payment_status"),
         nullable=False,
         server_default=sa.text("'seen'"),
     )
-    confirmations_at_credit: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    anomaly: Mapped[Optional[E.PaymentAnomaly]] = mapped_column(
+    confirmations_at_credit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    anomaly: Mapped[E.PaymentAnomaly | None] = mapped_column(
         _enum(E.PaymentAnomaly, "payment_anomaly"), nullable=True
     )
     created_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
 
-    invoice: Mapped[Optional[Invoice]] = relationship(
+    invoice: Mapped[Invoice | None] = relationship(
         "Invoice", back_populates="payments", foreign_keys=[invoice_id], lazy="raise"
     )
 
@@ -694,9 +700,9 @@ class Entitlement(Base):
     )
     granted_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
     #: NULL = perpetual (one-off product).
-    expires_at: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
-    revoked_at: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
-    revoke_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
+    revoke_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # TZ 5.8/T2.1, verbatim.
@@ -741,16 +747,16 @@ class Refund(Base):
         Integer, ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False
     )
     #: Explicitly asked from the user; the sender address is NOT trustworthy.
-    to_address: Mapped[Optional[str]] = mapped_column(String(42), nullable=True)
+    to_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
     status: Mapped[E.RefundStatus] = mapped_column(
         _enum(E.RefundStatus, "refund_status"),
         nullable=False,
         server_default=sa.text("'pending'"),
     )
-    operator_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    operator_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
-    executed_at: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
+    executed_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
 
     __table_args__ = (
         # Repeated processing of the same overpayment must not stack up requests.
@@ -783,21 +789,21 @@ class ManualReview(Base):
     kind: Mapped[E.ManualReviewKind] = mapped_column(
         _enum(E.ManualReviewKind, "manual_review_kind"), nullable=False
     )
-    invoice_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    invoice_id: Mapped[uuid.UUID | None] = mapped_column(
         PgUUID(as_uuid=True), ForeignKey("invoices.id", ondelete="RESTRICT"), nullable=True
     )
-    payment_id: Mapped[Optional[int]] = mapped_column(
+    payment_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("payments.id", ondelete="RESTRICT"), nullable=True
     )
     opened_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
-    resolved_at: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
-    operator_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    resolution: Mapped[Optional[E.ManualReviewResolution]] = mapped_column(
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
+    operator_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    resolution: Mapped[E.ManualReviewResolution | None] = mapped_column(
         _enum(E.ManualReviewResolution, "manual_review_resolution"), nullable=True
     )
-    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: Policy config version in force when the case was opened (TZ 5.8/T8).
-    policy_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    policy_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     __table_args__ = (
         # One open case per payment; reprocessing must not spam `/pending`.
@@ -839,7 +845,7 @@ class SweepExport(Base):
         Integer, ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False
     )
     file_ref: Mapped[str] = mapped_column(Text, nullable=False)
-    operator_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    operator_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         Index("ix_sweep_exports_generated_at", "generated_at"),
@@ -882,10 +888,10 @@ class Notification(Base):
         server_default=sa.text("'queued'"),
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sa.text("0"))
-    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    sent_at: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sent_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
     #: Telegram message id, so the bot can prove it never edits an address message.
-    message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
 
     __table_args__ = (
@@ -914,19 +920,21 @@ class AuditLogEntry(Base):
     __tablename__ = "audit_log"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    actor_kind: Mapped[E.ActorKind] = mapped_column(_enum(E.ActorKind, "actor_kind"), nullable=False)
+    actor_kind: Mapped[E.ActorKind] = mapped_column(
+        _enum(E.ActorKind, "actor_kind"), nullable=False
+    )
     #: tg_id for owner/user, process name for system.
     actor_id: Mapped[str] = mapped_column(String(64), nullable=False)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     target_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     target_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    before_state: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    after_state: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    before_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    after_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     args_json: Mapped[dict] = mapped_column(
         JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
     )
     #: Which policy config version applied at decision time (TZ 5.8/T8).
-    policy_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    policy_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
 
     __table_args__ = (
@@ -955,7 +963,7 @@ class RateLimit(Base):
         Integer, nullable=False, server_default=sa.text("0")
     )
     #: Behavioural cooldown after N consecutive expired invoices (TZ 5.8/T5.5).
-    cooldown_until: Mapped[Optional[dt.datetime]] = mapped_column(TS, nullable=True)
+    cooldown_until: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
     consecutive_expired: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=sa.text("0")
     )

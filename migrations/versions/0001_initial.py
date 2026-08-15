@@ -23,16 +23,16 @@ Create Date: 2026-08-15
 
 from __future__ import annotations
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0001"
-down_revision: Union[str, None] = None
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 # --------------------------------------------------------------------------
@@ -89,7 +89,7 @@ def pg_enum(name: str) -> postgresql.ENUM:
 
 EVM_ADDRESS_RE = r"^0x[0-9a-fA-F]{40}$"
 TX_HASH_RE = r"^0x[0-9a-f]{64}$"
-BIP32_PATH_PREFIX_RE = r"^m(/\d+'?)+$"
+BIP32_PATH_PREFIX_RE = r"^m(/\d+''?)+$"  # '' -> one literal apostrophe inside a SQL string
 FINGERPRINT_RE = r"^[0-9a-f]{8}$"
 
 AMOUNT_RAW = sa.Numeric(78, 0)  # full uint256 range, exact
@@ -113,7 +113,7 @@ BEGIN
     IF OLD.invoice_id IS NOT NULL
        AND NEW.invoice_id IS DISTINCT FROM OLD.invoice_id THEN
         RAISE EXCEPTION
-            'payments.invoice_id is immutable (payment id=%, bound to invoice %, refused rebind to %)',
+            'payments.invoice_id is immutable (payment %, bound to %, refused rebind to %)',
             OLD.id, OLD.invoice_id, NEW.invoice_id
             USING ERRCODE = '23514';
     END IF;
@@ -153,13 +153,13 @@ def upgrade() -> None:
         sa.Column("is_enabled", sa.Boolean(), server_default=sa.text("true"), nullable=False),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
         sa.CheckConstraint(
-            "min_confirmations >= 1", name="ck_chains_min_confirmations_positive"
+            "min_confirmations >= 1", name="min_confirmations_positive"
         ),
         sa.CheckConstraint(
-            "credit_threshold_usd >= 0", name="ck_chains_credit_threshold_non_negative"
+            "credit_threshold_usd >= 0", name="credit_threshold_non_negative"
         ),
         sa.CheckConstraint(
-            "last_indexed_block >= 0", name="ck_chains_last_indexed_block_non_negative"
+            "last_indexed_block >= 0", name="last_indexed_block_non_negative"
         ),
         sa.PrimaryKeyConstraint("chain_id", name="pk_chains"),
         comment="One row per EVM network the watcher indexes (TZ 5.2).",
@@ -176,10 +176,10 @@ def upgrade() -> None:
         sa.Column("timestamp", TS, nullable=False),
         sa.Column("status", pg_enum("block_status"), nullable=False),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("number >= 0", name="ck_blocks_number_non_negative"),
-        sa.CheckConstraint(f"hash ~ '{TX_HASH_RE}'", name="ck_blocks_hash_format"),
+        sa.CheckConstraint("number >= 0", name="number_non_negative"),
+        sa.CheckConstraint(f"hash ~ '{TX_HASH_RE}'", name="hash_format"),
         sa.CheckConstraint(
-            f"parent_hash ~ '{TX_HASH_RE}'", name="ck_blocks_parent_hash_format"
+            f"parent_hash ~ '{TX_HASH_RE}'", name="parent_hash_format"
         ),
         sa.ForeignKeyConstraint(
             ["chain_id"],
@@ -218,15 +218,15 @@ def upgrade() -> None:
         sa.Column("is_active", sa.Boolean(), server_default=sa.text("true"), nullable=False),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
         sa.CheckConstraint(
-            f"xpub_fingerprint ~ '{FINGERPRINT_RE}'", name="ck_hd_accounts_fingerprint_format"
+            f"xpub_fingerprint ~ '{FINGERPRINT_RE}'", name="fingerprint_format"
         ),
         sa.CheckConstraint(
-            f"path_prefix ~ '{BIP32_PATH_PREFIX_RE}'", name="ck_hd_accounts_path_prefix_format"
+            f"path_prefix ~ '{BIP32_PATH_PREFIX_RE}'", name="path_prefix_format"
         ),
-        sa.CheckConstraint("next_index >= 0", name="ck_hd_accounts_next_index_non_negative"),
-        sa.CheckConstraint("gap_reserve >= 0", name="ck_hd_accounts_gap_reserve_non_negative"),
+        sa.CheckConstraint("next_index >= 0", name="next_index_non_negative"),
+        sa.CheckConstraint("gap_reserve >= 0", name="gap_reserve_non_negative"),
         sa.CheckConstraint(
-            "max_active_addresses > 0", name="ck_hd_accounts_max_active_addresses_positive"
+            "max_active_addresses > 0", name="max_active_addresses_positive"
         ),
         sa.PrimaryKeyConstraint("id", name="pk_hd_accounts"),
         sa.UniqueConstraint("path_prefix", name="uq_hd_accounts_path_prefix"),
@@ -262,33 +262,33 @@ def upgrade() -> None:
         sa.Column("swept_at", TS, nullable=True),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
         sa.CheckConstraint(
-            "derivation_index >= 0", name="ck_receive_addresses_derivation_index_non_negative"
+            "derivation_index >= 0", name="derivation_index_non_negative"
         ),
         sa.CheckConstraint(
-            f"address ~ '{EVM_ADDRESS_RE}'", name="ck_receive_addresses_address_format"
+            f"address ~ '{EVM_ADDRESS_RE}'", name="address_format"
         ),
         # Condition 1 of the reuse rules: a funded address never re-enters the pool.
         sa.CheckConstraint(
             "status <> 'free' OR (current_invoice_id IS NULL "
             "AND reserved_from_block IS NULL AND NOT ever_funded)",
-            name="ck_receive_addresses_free_state_clean",
+            name="free_state_clean",
         ),
         sa.CheckConstraint(
             "status <> 'reserved' OR (current_invoice_id IS NOT NULL "
             "AND reserved_from_block IS NOT NULL)",
-            name="ck_receive_addresses_reserved_state_bound",
+            name="reserved_state_bound",
         ),
         sa.CheckConstraint(
             "first_seen_funds_at IS NULL OR ever_funded",
-            name="ck_receive_addresses_funds_imply_ever_funded",
+            name="funds_imply_ever_funded",
         ),
         sa.CheckConstraint(
             "swept_at IS NULL OR (ever_funded AND status = 'swept')",
-            name="ck_receive_addresses_swept_state",
+            name="swept_state",
         ),
         sa.CheckConstraint(
             "reserved_from_block IS NULL OR reserved_from_block >= 0",
-            name="ck_receive_addresses_reserved_from_block_non_negative",
+            name="reserved_from_block_non_negative",
         ),
         sa.ForeignKeyConstraint(
             ["hd_account_id"],
@@ -335,15 +335,15 @@ def upgrade() -> None:
         sa.Column("is_native", sa.Boolean(), server_default=sa.text("false"), nullable=False),
         sa.Column("is_enabled", sa.Boolean(), server_default=sa.text("true"), nullable=False),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("decimals BETWEEN 0 AND 36", name="ck_assets_decimals_range"),
+        sa.CheckConstraint("decimals BETWEEN 0 AND 36", name="decimals_range"),
         sa.CheckConstraint(
             "(is_native AND contract_address IS NULL) "
             "OR (NOT is_native AND contract_address IS NOT NULL)",
-            name="ck_assets_native_has_no_contract",
+            name="native_has_no_contract",
         ),
         sa.CheckConstraint(
             f"contract_address IS NULL OR contract_address ~ '{EVM_ADDRESS_RE}'",
-            name="ck_assets_contract_address_format",
+            name="contract_address_format",
         ),
         sa.ForeignKeyConstraint(
             ["chain_id"],
@@ -378,14 +378,14 @@ def upgrade() -> None:
         sa.Column("subscription_days", sa.Integer(), nullable=True),
         sa.Column("active", sa.Boolean(), server_default=sa.text("true"), nullable=False),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("price_usd > 0", name="ck_products_price_positive"),
+        sa.CheckConstraint("price_usd > 0", name="price_positive"),
         sa.CheckConstraint(
             "(kind = 'subscription') = (subscription_days IS NOT NULL)",
-            name="ck_products_subscription_days_matches_kind",
+            name="subscription_days_matches_kind",
         ),
         sa.CheckConstraint(
             "subscription_days IS NULL OR subscription_days > 0",
-            name="ck_products_subscription_days_positive",
+            name="subscription_days_positive",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_products"),
         sa.UniqueConstraint("sku", name="uq_products_sku"),
@@ -410,7 +410,7 @@ def upgrade() -> None:
         sa.Column("bot_blocked_at", TS, nullable=True),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
         sa.CheckConstraint(
-            "internal_balance_usd >= 0", name="ck_users_internal_balance_non_negative"
+            "internal_balance_usd >= 0", name="internal_balance_non_negative"
         ),
         sa.PrimaryKeyConstraint("id", name="pk_users"),
         sa.UniqueConstraint("tg_id", name="uq_users_tg_id"),
@@ -445,19 +445,19 @@ def upgrade() -> None:
         sa.Column("integrity_mac", postgresql.BYTEA(), nullable=False),
         sa.Column("public_token", sa.String(length=64), nullable=False),
         sa.Column("policy_version", sa.String(length=32), nullable=False),
-        sa.CheckConstraint("amount_due_raw > 0", name="ck_invoices_amount_due_raw_positive"),
-        sa.CheckConstraint("amount_due_usd > 0", name="ck_invoices_amount_due_usd_positive"),
-        sa.CheckConstraint("rate_snapshot > 0", name="ck_invoices_rate_snapshot_positive"),
+        sa.CheckConstraint("amount_due_raw > 0", name="amount_due_raw_positive"),
+        sa.CheckConstraint("amount_due_usd > 0", name="amount_due_usd_positive"),
+        sa.CheckConstraint("rate_snapshot > 0", name="rate_snapshot_positive"),
         sa.CheckConstraint(
-            "topup_window_until >= expires_at", name="ck_invoices_topup_window_after_expiry"
+            "topup_window_until >= expires_at", name="topup_window_after_expiry"
         ),
-        sa.CheckConstraint("expires_at > created_at", name="ck_invoices_expiry_after_creation"),
+        sa.CheckConstraint("expires_at > created_at", name="expiry_after_creation"),
         sa.CheckConstraint(
             "settled_at IS NULL OR settled_at >= created_at",
-            name="ck_invoices_settled_after_creation",
+            name="settled_after_creation",
         ),
         sa.CheckConstraint(
-            "octet_length(integrity_mac) = 32", name="ck_invoices_integrity_mac_length"
+            "octet_length(integrity_mac) = 32", name="integrity_mac_length"
         ),
         sa.ForeignKeyConstraint(
             ["user_id"], ["users.id"], name="fk_invoices_user_id_users", ondelete="RESTRICT"
@@ -545,20 +545,20 @@ def upgrade() -> None:
         sa.Column("confirmations_at_credit", sa.Integer(), nullable=True),
         sa.Column("anomaly", pg_enum("payment_anomaly"), nullable=True),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("amount_raw > 0", name="ck_payments_amount_raw_positive"),
-        sa.CheckConstraint("block_number >= 0", name="ck_payments_block_number_non_negative"),
-        sa.CheckConstraint("log_index >= -1", name="ck_payments_log_index_valid"),
-        sa.CheckConstraint(f"tx_hash ~ '{TX_HASH_RE}'", name="ck_payments_tx_hash_format"),
+        sa.CheckConstraint("amount_raw > 0", name="amount_raw_positive"),
+        sa.CheckConstraint("block_number >= 0", name="block_number_non_negative"),
+        sa.CheckConstraint("log_index >= -1", name="log_index_valid"),
+        sa.CheckConstraint(f"tx_hash ~ '{TX_HASH_RE}'", name="tx_hash_format"),
         sa.CheckConstraint(
-            f"sender IS NULL OR sender ~ '{EVM_ADDRESS_RE}'", name="ck_payments_sender_format"
+            f"sender IS NULL OR sender ~ '{EVM_ADDRESS_RE}'", name="sender_format"
         ),
         sa.CheckConstraint(
             "status <> 'credited' OR confirmations_at_credit IS NOT NULL",
-            name="ck_payments_credited_records_confirmations",
+            name="credited_records_confirmations",
         ),
         sa.CheckConstraint(
             "confirmations_at_credit IS NULL OR confirmations_at_credit >= 0",
-            name="ck_payments_confirmations_non_negative",
+            name="confirmations_non_negative",
         ),
         sa.ForeignKeyConstraint(
             ["chain_id"],
@@ -641,11 +641,11 @@ def upgrade() -> None:
         sa.Column("revoke_reason", sa.Text(), nullable=True),
         sa.CheckConstraint(
             "revoked_at IS NOT NULL OR revoke_reason IS NULL",
-            name="ck_entitlements_revoke_reason_needs_revocation",
+            name="revoke_reason_needs_revocation",
         ),
         sa.CheckConstraint(
             "revoked_at IS NULL OR revoked_at >= granted_at",
-            name="ck_entitlements_revoked_after_granted",
+            name="revoked_after_granted",
         ),
         sa.ForeignKeyConstraint(
             ["user_id"], ["users.id"], name="fk_entitlements_user_id_users", ondelete="RESTRICT"
@@ -699,15 +699,15 @@ def upgrade() -> None:
         sa.Column("note", sa.Text(), nullable=True),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
         sa.Column("executed_at", TS, nullable=True),
-        sa.CheckConstraint("amount_raw > 0", name="ck_refunds_amount_raw_positive"),
+        sa.CheckConstraint("amount_raw > 0", name="amount_raw_positive"),
         sa.CheckConstraint(
             f"to_address IS NULL OR to_address ~ '{EVM_ADDRESS_RE}'",
-            name="ck_refunds_to_address_format",
+            name="to_address_format",
         ),
         sa.CheckConstraint(
             "status <> 'executed' OR (executed_at IS NOT NULL "
             "AND to_address IS NOT NULL AND operator_id IS NOT NULL)",
-            name="ck_refunds_executed_requires_details",
+            name="executed_requires_details",
         ),
         sa.ForeignKeyConstraint(
             ["invoice_id"],
@@ -746,13 +746,13 @@ def upgrade() -> None:
         sa.Column("policy_version", sa.String(length=32), nullable=True),
         sa.CheckConstraint(
             "invoice_id IS NOT NULL OR payment_id IS NOT NULL",
-            name="ck_manual_reviews_targets_something",
+            name="targets_something",
         ),
         sa.CheckConstraint(
             "(resolved_at IS NULL AND resolution IS NULL) "
             "OR (resolved_at IS NOT NULL AND resolution IS NOT NULL "
             "AND operator_id IS NOT NULL)",
-            name="ck_manual_reviews_resolution_complete",
+            name="resolution_complete",
         ),
         sa.ForeignKeyConstraint(
             ["invoice_id"],
@@ -795,9 +795,9 @@ def upgrade() -> None:
         sa.Column("file_ref", sa.Text(), nullable=False),
         sa.Column("operator_id", sa.BigInteger(), nullable=True),
         sa.CheckConstraint(
-            "address_count >= 0", name="ck_sweep_exports_address_count_non_negative"
+            "address_count >= 0", name="address_count_non_negative"
         ),
-        sa.CheckConstraint("total_raw >= 0", name="ck_sweep_exports_total_raw_non_negative"),
+        sa.CheckConstraint("total_raw >= 0", name="total_raw_non_negative"),
         sa.ForeignKeyConstraint(
             ["asset_id"],
             ["assets.id"],
@@ -834,9 +834,9 @@ def upgrade() -> None:
         sa.Column("sent_at", TS, nullable=True),
         sa.Column("message_id", sa.BigInteger(), nullable=True),
         sa.Column("created_at", TS, server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("attempts >= 0", name="ck_notifications_attempts_non_negative"),
+        sa.CheckConstraint("attempts >= 0", name="attempts_non_negative"),
         sa.CheckConstraint(
-            "status <> 'sent' OR sent_at IS NOT NULL", name="ck_notifications_sent_has_timestamp"
+            "status <> 'sent' OR sent_at IS NOT NULL", name="sent_has_timestamp"
         ),
         sa.ForeignKeyConstraint(
             ["user_id"],
@@ -897,10 +897,10 @@ def upgrade() -> None:
             "consecutive_expired", sa.Integer(), server_default=sa.text("0"), nullable=False
         ),
         sa.CheckConstraint(
-            "invoices_created >= 0", name="ck_rate_limits_invoices_created_non_negative"
+            "invoices_created >= 0", name="invoices_created_non_negative"
         ),
         sa.CheckConstraint(
-            "consecutive_expired >= 0", name="ck_rate_limits_consecutive_expired_non_negative"
+            "consecutive_expired >= 0", name="consecutive_expired_non_negative"
         ),
         sa.ForeignKeyConstraint(
             ["user_id"], ["users.id"], name="fk_rate_limits_user_id_users", ondelete="CASCADE"
