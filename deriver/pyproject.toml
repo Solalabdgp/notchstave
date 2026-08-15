@@ -1,16 +1,35 @@
 # deriver's own, isolated pyproject.toml — see the root pyproject.toml header
 # comment for why this file exists separately (TZ 4/5.1/5.8-T4: deriver must
-# never be able to import a network library, and a separate installable
+# never be able to reach an RPC node or the internet, and a separate installable
 # package makes that mechanical rather than a matter of discipline).
 #
-# THIS LIST MUST STAY EXACTLY {bip-utils, coincurve, pydantic}. Do not add
-# httpx, aiohttp, web3, redis, celery, aiogram, or fastapi here under any
+# THIS LIST MUST STAY EXACTLY {bip-utils, coincurve, pydantic, psycopg}. Do not
+# add httpx, aiohttp, web3, redis, celery, aiogram, or fastapi here under any
 # circumstance — that would silently defeat the isolation this package exists
 # for. If deriver ever needs a piece of a shared schema/config from core/, add
 # a small trimmed copy of just that piece here rather than depending on core/
 # (which pulls in sqlalchemy/pydantic-adjacent stack that's fine, but core/
 # itself must stay free to grow network-adjacent helpers later without ever
 # becoming an accidental deriver dependency).
+#
+# Why psycopg is on that list and is not a contradiction: TZ 5.1 says the
+# deriver "не пишет в БД ничего кроме адресов и индексов" — it writes. It is the
+# only process that may INSERT/UPDATE receive_addresses and bump
+# hd_accounts.next_index (TZ 5.8/T1.2, enforced by the grants in migration
+# 0002), so a driver is a hard requirement, not a convenience. The isolation
+# being protected is against *outbound* network reach — RPC nodes, the Telegram
+# API, price feeds — not against the local Postgres socket, which sits inside
+# the same trust boundary the deriver already lives in (TZ 5.8, "что защищаем и
+# где границы доверия"). An earlier version of this file banned every
+# DB-capable dependency, which left the one process that owns the address pool
+# unable to write to it.
+#
+# psycopg (v3) and not asyncpg/psycopg2: DATABASE_URL across the repo is
+# postgresql+psycopg:// (.env.example, alembic.ini, migrations/env.py). Raw
+# psycopg rather than sqlalchemy + core.db.models, because importing core/ here
+# is exactly what the paragraph above forbids; the deriver runs a handful of
+# hand-written statements (pool pickup, address insert, next_index bump) and
+# does not need the ORM.
 #
 # Versions verified against PyPI's JSON API on 2026-08-15.
 
@@ -21,12 +40,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "notchstave-deriver"
 version = "0.1.0"
-description = "Notchstave deriver — holds the account xpub in memory, derives BIP-32/44 addresses. No network dependencies, by design."
+description = "Notchstave deriver — holds the account xpub in memory, derives BIP-32/44 addresses. No outbound network dependencies, by design."
 requires-python = ">=3.12"
 dependencies = [
     "bip-utils==2.12.2",
     "coincurve==21.0.0",
     "pydantic==2.13.4",
+    # Sole writer of receive_addresses / hd_accounts.next_index (TZ 5.1,
+    # 5.8/T1.2). [binary] so the container needs no libpq-dev at build time.
+    "psycopg[binary]==3.3.4",
 ]
 
 [dependency-groups]

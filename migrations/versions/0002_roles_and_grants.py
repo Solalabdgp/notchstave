@@ -56,10 +56,16 @@ GRANTS: dict[str, dict[str, str]] = {
     # next_index is bumped only by the deriver, inside the reservation
     # transaction (TZ 5.1, p. 3).
     "hd_accounts": {DERIVER: RU, API: R, BOT: R, WATCHER: R, SETTLER: R},
-    # TZ 5.8/T1.2 verbatim: api / bot / watcher get SELECT and nothing else.
-    # The settler needs UPDATE to mark funded / swept / return-to-pool, which is
-    # a state transition on an existing row, not the creation of an address.
-    "receive_addresses": {DERIVER: RW, API: R, BOT: R, WATCHER: R, SETTLER: RU, NOTIFIER: R},
+    # TZ 5.8/T1.2: write access to receive_addresses belongs to the deriver and
+    # to nobody else. The settler is SELECT-only here too — TZ section 4 scopes
+    # it to "переводы -> инвойсы, подтверждения, реорги, выдача и отзыв
+    # доступа", which is invoices / payments / entitlements, not the address
+    # pool. Marking an address funded / swept / free is still a write to a row
+    # whose whole point is that only one process can touch it, so the settler
+    # asks the deriver to perform that transition instead of doing it itself.
+    # Earlier revisions of this file granted SETTLER UPDATE here; that was a
+    # hole in T1.2, not a documented exception.
+    "receive_addresses": {DERIVER: RW, API: R, BOT: R, WATCHER: R, SETTLER: R, NOTIFIER: R},
     "blocks": {WATCHER: RW, SETTLER: RU},
     "invoices": {DERIVER: R, API: RW, BOT: RW, WATCHER: R, SETTLER: RU, NOTIFIER: R},
     "payments": {API: R, BOT: R, WATCHER: RI, SETTLER: RU, NOTIFIER: R},
@@ -141,6 +147,24 @@ def upgrade() -> None:
             BEGIN
                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
                     EXECUTE 'REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_log FROM {role}';
+                END IF;
+            END
+            $g$;
+            """
+        )
+
+    # Same idea for T1.2, and the reason it is spelled out separately: the
+    # settler used to hold UPDATE on this table. A single REVOKE that runs after
+    # the whole GRANTS matrix means a future edit to that dict cannot quietly
+    # reopen the hole — it has to delete these lines, which is a visible act.
+    for role in (API, BOT, WATCHER, SETTLER, NOTIFIER):
+        op.execute(
+            f"""
+            DO $g$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+                    EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE '
+                            'ON TABLE receive_addresses FROM {role}';
                 END IF;
             END
             $g$;

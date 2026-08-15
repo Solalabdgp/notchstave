@@ -11,8 +11,11 @@
 # inside deriver/) physically cannot resolve web3/aiogram/fastapi/redis/
 # celery, because they are not declared there and that file has no reference
 # to this one. A CI step can later diff deriver/pyproject.toml's dependency
-# list against an allowlist of exactly {bip-utils, coincurve, pydantic} and
-# fail the build the moment that changes.
+# list against an allowlist of exactly {bip-utils, coincurve, pydantic,
+# psycopg} and fail the build the moment that changes. psycopg is on that
+# allowlist deliberately: the deriver is the only process allowed to write
+# receive_addresses (TZ 5.1, 5.8/T1.2), and the isolation being enforced is
+# against outbound network reach, not against the local database.
 #
 # This root file covers bot / api / watcher / settler / notifier / core — the
 # five process boundaries plus the shared DB-models/config package (core/) —
@@ -38,6 +41,11 @@ dependencies = [
     "fastapi==0.141.1",
     "sqlalchemy==2.0.52",
     "alembic==1.19.1",
+    # DATABASE_URL is postgresql+psycopg:// everywhere in this repo
+    # (.env.example, alembic.ini, migrations/env.py), so the driver has to be
+    # declared — sqlalchemy alone does not pull one in, and without this line
+    # `alembic upgrade head` fails on a clean install with ModuleNotFoundError.
+    "psycopg[binary]==3.3.4",
     "redis==8.1.0",
     "celery==5.6.3",
     "web3==7.16.0",

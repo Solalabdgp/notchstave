@@ -45,10 +45,13 @@ PRICE_USD = Numeric(12, 2)
 # --- reusable CHECK fragments ----------------------------------------------
 EVM_ADDRESS_RE = r"^0x[0-9a-fA-F]{40}$"
 TX_HASH_RE = r"^0x[0-9a-f]{64}$"
-# m/44'/60'/0'  — hardened on all three upper levels (TZ 5.1, rule 1).
+# m/44'/60'/<account>'  — hardened on all three upper levels, and nothing else
+# accepted (TZ 5.1, rule 1). Hardening is what bounds the blast radius of an
+# xpub leak to a single account, so the CHECK must reject `m/44/60/0` outright
+# rather than treat the apostrophe as optional.
 # NOTE: these constants are embedded verbatim into DDL, so the apostrophe is
 # doubled ('') the way a SQL string literal requires. Do not reuse this value as
 # a Python regex without collapsing '' back to '.
-BIP32_PATH_PREFIX_RE = r"^m(/\d+''?)+$"
+BIP32_PATH_PREFIX_RE = r"^m/44''/60''/\d+''$"
 # BIP-32 key fingerprint, 4 bytes rendered as lowercase hex.
 FINGERPRINT_RE = r"^[0-9a-f]{8}$"

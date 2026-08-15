@@ -89,7 +89,12 @@ def pg_enum(name: str) -> postgresql.ENUM:
 
 EVM_ADDRESS_RE = r"^0x[0-9a-fA-F]{40}$"
 TX_HASH_RE = r"^0x[0-9a-f]{64}$"
-BIP32_PATH_PREFIX_RE = r"^m(/\d+''?)+$"  # '' -> one literal apostrophe inside a SQL string
+# Exactly three hardened levels: m/44'/60'/<account>'  (TZ 5.1, rule 1 — the
+# apostrophes are what stop an attacker who holds the account xpub from walking
+# up to the master key). The old pattern `^m(/\d+''?)+$` made the apostrophe
+# optional and the depth free, so `m/44/60/0` passed the CHECK.
+# '' -> one literal apostrophe inside a SQL string literal.
+BIP32_PATH_PREFIX_RE = r"^m/44''/60''/\d+''$"
 FINGERPRINT_RE = r"^[0-9a-f]{8}$"
 
 AMOUNT_RAW = sa.Numeric(78, 0)  # full uint256 range, exact
