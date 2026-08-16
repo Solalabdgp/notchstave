@@ -1,0 +1,30 @@
+# Test environment for the settler (TZ section 8).
+#
+# A deliberate subset of the root pyproject, not a second source of truth: the
+# settler imports nothing from aiogram / fastapi / web3 / celery and installing
+# them to run these tests would add two minutes to every run for no coverage.
+# The pins below MUST match the root pyproject.toml where the package appears
+# in both — if you bump one, bump the other.
+#
+# Two entries do not appear in the root file, for reasons worth stating:
+#
+# * `greenlet` — SQLAlchemy's async layer is a greenlet bridge over the sync
+#   core, so `create_async_engine` needs it at runtime. The root pyproject
+#   declares plain `sqlalchemy==2.0.52` while `settler/main.py` calls
+#   `create_async_engine`, which means a clean production install of that file
+#   would import fine and then fail on the first query. That is a real packaging
+#   bug in the root file, recorded in the Week 2 TODO list; pinning greenlet
+#   here keeps the tests honest in the meantime rather than papering over it.
+# * `pytest-asyncio` — test-only, and the async tests are the point (twenty
+#   concurrent connections cannot be expressed synchronously).
+#
+# Versions resolved against the PyPI JSON API on 2026-08-17, not from memory.
+
+sqlalchemy==2.0.52
+greenlet==3.5.5
+psycopg[binary]==3.3.4
+alembic==1.19.1
+prometheus-client==0.26.0
+
+pytest==9.1.1
+pytest-asyncio==1.4.0

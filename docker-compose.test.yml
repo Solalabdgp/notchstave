@@ -1,0 +1,85 @@
+# Notchstave — integration test rig (TZ section 8).
+#
+# The settler's correctness argument is made almost entirely out of PostgreSQL
+# features: a partial unique index, a BEFORE UPDATE trigger, SELECT FOR UPDATE,
+# and the exact rowcount of a compare-and-set. None of that exists in SQLite and
+# none of it can be mocked — a mock that returns "0 rows affected" proves only
+# that the test author knows what the answer should be. So the settler tests run
+# against a real Postgres 17, the same major version as production, with the
+# schema built by the real Alembic migrations rather than by `create_all`
+# (create_all would silently skip the trigger, which is one of the things under
+# test).
+#
+# Self-contained credentials on purpose: this file must run on a clean checkout
+# with no .env, because "the tests need a secret" is how a test suite stops
+# being run. It listens on 127.0.0.1:55432 so it cannot collide with the dev
+# database from docker-compose.yml on 5432.
+#
+#   docker compose -f docker-compose.test.yml run --rm tests
+#
+# Everything is thrown away between runs: the database has no volume, so a
+# passing run cannot depend on state left behind by a previous one.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: notchstave-test-pg
+    environment:
+      POSTGRES_USER: notchstave
+      POSTGRES_PASSWORD: testpw
+      POSTGRES_DB: notchstave_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    # A tmpfs data directory rather than a named volume: state must not survive
+    # a run, and a suite whose green depends on rows left behind by the previous
+    # one is worse than no suite. Size is pinned because the Docker default
+    # varies by host — an implicit default is how this passes on a laptop and
+    # fills up in CI.
+    volumes:
+      - type: tmpfs
+        target: /var/lib/postgresql/data
+        tmpfs:
+          size: 1073741824  # 1 GiB; the whole test database is a few MB
+    command:
+      # The concurrency tests open twenty simultaneous connections to one
+      # invoice; the default of 100 is enough, but the default 128MB shared
+      # buffer on a tmpfs data directory is not worth the risk of a flake.
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "fsync=off"
+      - "-c"
+      - "synchronous_commit=off"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notchstave -d notchstave_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  tests:
+    image: python:3.12-slim
+    container_name: notchstave-test-runner
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # psycopg 3 is one driver with a sync and an async face; SQLAlchemy picks
+      # the async one for an async engine. Same URL for Alembic and for tests.
+      DATABASE_URL: postgresql+psycopg://notchstave:testpw@postgres:5432/notchstave_test
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./:/app
+      - notchstave_test_pipcache:/root/.cache/pip
+    working_dir: /app
+    command:
+      - bash
+      - -lc
+      - |
+        pip install -q -r settler/tests/requirements.txt
+        alembic upgrade head
+        pytest settler/tests -v
+
+volumes:
+  notchstave_test_pipcache:

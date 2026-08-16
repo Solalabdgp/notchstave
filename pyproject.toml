@@ -39,7 +39,12 @@ requires-python = ">=3.12"
 dependencies = [
     "aiogram==3.30.0",
     "fastapi==0.141.1",
-    "sqlalchemy==2.0.52",
+    # The [asyncio] extra, not bare sqlalchemy: settler/main.py and every other
+    # process here use create_async_engine, whose greenlet bridge is an extra
+    # rather than a core dependency. Without it a clean install imports fine and
+    # then fails on the first query, which is the worst possible place to find
+    # out.
+    "sqlalchemy[asyncio]==2.0.52",
     "alembic==1.19.1",
     # DATABASE_URL is postgresql+psycopg:// everywhere in this repo
     # (.env.example, alembic.ini, migrations/env.py), so the driver has to be
@@ -58,6 +63,10 @@ dev = [
     "ruff==0.16.3",
     "mypy==2.3.1",
     "pytest==9.1.1",
+    # The settler's tests are async because the properties they check are
+    # concurrency properties — twenty workers on one invoice cannot be
+    # expressed synchronously. Verified against the PyPI JSON API 2026-08-17.
+    "pytest-asyncio==1.4.0",
 ]
 
 [tool.setuptools]
@@ -82,4 +91,20 @@ strict = true
 exclude = ["deriver/", "migrations/versions/"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# deriver/tests is deliberately absent: the deriver installs into its own
+# isolated environment (deriver/pyproject.toml) precisely so that this one
+# cannot reach it, and running both suites from one interpreter would undo that
+# separation. It is run separately — `pytest deriver/tests` from the deriver
+# environment.
+testpaths = ["settler/tests"]
+
+# The settler suite talks to a real Postgres over an async engine, so every
+# test in it is a coroutine. `auto` keeps the marker off ~40 test functions
+# that would all carry the identical decorator otherwise.
+asyncio_mode = "auto"
+# Pinned explicitly rather than left to the default: the engine fixture is
+# per-test on purpose (see settler/tests/conftest.py — a session-scoped engine
+# bound to one event loop is a whole class of confusing failures), and stating
+# the scope here means a future pytest-asyncio default change cannot silently
+# alter it.
+asyncio_default_fixture_loop_scope = "function"

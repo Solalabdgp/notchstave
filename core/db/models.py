@@ -447,7 +447,7 @@ class User(Base):
     internal_balance_usd: Mapped[Decimal] = mapped_column(
         USD_AMOUNT, nullable=False, server_default=sa.text("0")
     )
-    settings_json: Mapped[dict] = mapped_column(
+    settings_json: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
     )
     #: Set when Telegram reports the bot was blocked; notifier stops sending (TZ 5.7).
@@ -879,7 +879,7 @@ class Notification(Base):
     #: Identifier of whatever the message is about (invoice uuid, payment id...).
     ref_id: Mapped[str] = mapped_column(String(64), nullable=False)
     dedup_key: Mapped[str] = mapped_column(String(64), nullable=False)
-    payload_json: Mapped[dict] = mapped_column(
+    payload_json: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
     )
     status: Mapped[E.NotificationStatus] = mapped_column(
@@ -928,9 +928,9 @@ class AuditLogEntry(Base):
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     target_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     target_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    before_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    after_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    args_json: Mapped[dict] = mapped_column(
+    before_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    after_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    args_json: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
     )
     #: Which policy config version applied at decision time (TZ 5.8/T8).
