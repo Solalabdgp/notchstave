@@ -37,3 +37,5 @@ Thumbs.db
 
 # Docker / local data
 *.log
+receipts/
+review-receipts/
