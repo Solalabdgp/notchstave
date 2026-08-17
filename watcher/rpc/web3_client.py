@@ -84,7 +84,7 @@ class Web3RpcClient(RpcClient):
                 self._provider.make_request(method, params),  # type: ignore[arg-type]
                 timeout=self._timeout,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise RpcError(
                 f"timeout calling {method}",
                 error_class=RpcErrorClass.TIMEOUT,
@@ -189,6 +189,47 @@ class Web3RpcClient(RpcClient):
                 method="eth_getLogs",
             )
         return result
+
+    async def get_balance(self, address: str, block: int | BlockTag = "latest") -> int:
+        result = await self._request("eth_getBalance", [address, self._block_param(block)])
+        return self._hex_quantity(result, "eth_getBalance")
+
+    async def call(self, params: dict[str, Any], block: int | BlockTag = "latest") -> str:
+        result = await self._request("eth_call", [params, self._block_param(block)])
+        if not isinstance(result, str) or not result.startswith("0x"):
+            raise RpcError(
+                "eth_call did not return hex data",
+                error_class=RpcErrorClass.MALFORMED_RESPONSE,
+                provider=self.name,
+                method="eth_call",
+            )
+        return result
+
+    def _hex_quantity(self, result: Any, method: str) -> int:
+        """A JSON-RPC QUANTITY, or a loud failure.
+
+        Parsed rather than trusted because the alternative failure mode is
+        silent: a provider answering ``null`` for a balance would otherwise
+        become ``0``, and a zero balance is exactly what `/reconcile` reads as
+        "the money is gone" — the most serious alert in TZ section 7 raised by a
+        malformed response instead of by a real discrepancy.
+        """
+        if not isinstance(result, str):
+            raise RpcError(
+                f"{method} returned {type(result).__name__}, expected a hex quantity",
+                error_class=RpcErrorClass.MALFORMED_RESPONSE,
+                provider=self.name,
+                method=method,
+            )
+        try:
+            return int(result, 16)
+        except ValueError as exc:
+            raise RpcError(
+                f"{method} returned {result!r}, which is not a hex quantity",
+                error_class=RpcErrorClass.MALFORMED_RESPONSE,
+                provider=self.name,
+                method=method,
+            ) from exc
 
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         result = await self._request("eth_getTransactionReceipt", [tx_hash])

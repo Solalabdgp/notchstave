@@ -68,10 +68,15 @@ __all__ = [
     "revoke_entitlements_for_invoices",
     "unsettle_invoices",
     "expire_invoice",
+    "expire_invoice_past_rate_lock",
     "invoices_past_topup_window",
+    "invoices_past_rate_lock",
     "unreviewed_anomalous_payments",
+    "credit_internal_balance",
     "is_active_entitlement_conflict",
     "ENTITLEMENTS_ACTIVE_UNIQ",
+    "SQL_CREDIT_INTERNAL_BALANCE",
+    "SQL_EXPIRE_INVOICE_PAST_RATE_LOCK",
 ]
 
 #: The partial unique index that is the real defence against a double grant
@@ -638,9 +643,10 @@ SQL_WRITE_AUDIT = sa.text(
     """
     INSERT INTO audit_log (actor_kind, actor_id, action, target_kind, target_id,
                            before_state, after_state, args_json, policy_version)
-    VALUES ('system', :actor_id, :action, :target_kind, :target_id,
+    VALUES (CAST(:actor_kind AS actor_kind), :actor_id, :action, :target_kind, :target_id,
             CAST(:before_state AS jsonb), CAST(:after_state AS jsonb),
             CAST(:args AS jsonb), :policy_version)
+    RETURNING id
     """
 )
 
@@ -656,16 +662,34 @@ async def write_audit(
     after_state: dict[str, Any] | None,
     args: dict[str, Any],
     policy_version: str,
-) -> None:
+    actor_kind: str = "system",
+) -> int:
     """Append-only record of a money decision (TZ 5.8/T8).
 
     The settler role holds INSERT and SELECT on ``audit_log`` and nothing else
-    (migration 0002), so this is structurally append-only: there is no code
-    path that could edit a decision after the fact even if one were written.
+    (migrations 0002 and 0003), so this is structurally append-only: there is no
+    code path that could edit a decision after the fact even if one were written.
+
+    ``actor_kind`` defaults to ``system`` — the settler acting on its own, which
+    is every caller in :mod:`settler.service`. The admin commands of TZ 3.4 pass
+    ``owner``, because "the owner decided this" and "the policy table decided
+    this" are the two answers `/pending` and a post-incident review need to tell
+    apart, and an ``actor_id`` string alone does not separate them reliably.
+
+    Note on the vocabulary: TZ 5.8/T7 speaks of admin actions, while the
+    ``actor_kind`` enum shipped in migration 0001 offers ``owner / user /
+    system``. There is exactly one admin in this system and TZ 3.4 calls them
+    the owner ("доступные только владельцу по фиксированному tg_id"), so
+    ``owner`` is that role under the name the schema already uses. Adding an
+    ``admin`` value would be an enum migration for a synonym.
+
+    Returns the id of the row, so a caller can reference the audit entry from
+    the record it is about to write.
     """
-    await conn.execute(
+    result = await conn.execute(
         SQL_WRITE_AUDIT,
         {
+            "actor_kind": actor_kind,
             "actor_id": actor_id,
             "action": action,
             "target_kind": target_kind,
@@ -676,6 +700,62 @@ async def write_audit(
             "policy_version": policy_version,
         },
     )
+    return int(result.scalar_one())
+
+
+# ---------------------------------------------------------------------------
+# Internal balance (TZ 5.5 overpayment, migration 0003)
+# ---------------------------------------------------------------------------
+
+#: The one statement allowed to touch a user's balance.
+#:
+#: Additive, never absolute. Migration 0003 grants the settler ``UPDATE
+#: (internal_balance_usd)`` and nothing else on ``users``, so PostgreSQL already
+#: refuses to let this role write any other column; what the *statement* adds is
+#: that the role cannot **set** a balance either, only add to it. Between the two
+#: — a column-level grant and an additive statement — a compromised settler can
+#: make a balance too large, which is a loud accounting error `/reconcile`
+#: surfaces, and cannot make one disappear, which would be a silent theft.
+#:
+#: ``delta > 0`` is in the WHERE clause rather than in Python for the usual
+#: reason: a guard that lives in the statement cannot be skipped by a future
+#: caller that forgot about it.
+SQL_CREDIT_INTERNAL_BALANCE = sa.text(
+    """
+    UPDATE users
+       SET internal_balance_usd = internal_balance_usd + :delta_usd
+     WHERE id = :user_id
+       AND :delta_usd > 0
+    RETURNING internal_balance_usd
+    """
+)
+
+
+async def credit_internal_balance(
+    conn: AsyncConnection, *, user_id: int, delta_usd: Decimal
+) -> Decimal | None:
+    """Add ``delta_usd`` to a user's internal balance (TZ 5.5, overpayment).
+
+    ``None`` means nothing was written — either the delta was not positive or
+    the user is gone. Both are the caller's business to report, not this
+    function's to raise about.
+
+    **Idempotency is the caller's job and is not optional.** This is the one
+    place in the settler that increments rather than recomputes, which is
+    exactly the mechanism TZ 5.3 forbids for the settled total. It is
+    unavoidable here — a balance *is* a running figure, there is no ledger to
+    re-sum — so the protection is moved one level up: :func:`settler.service
+    ._apply_settlement` credits only when the ``overpaid_credited`` outbox row
+    was actually inserted, and ``UNIQUE (kind, ref_id, dedup_key)`` on
+    ``notifications`` makes that insert happen exactly once per grant. Re-running
+    the settler over a settled invoice therefore cannot credit twice.
+    """
+    row = (
+        await conn.execute(
+            SQL_CREDIT_INTERNAL_BALANCE, {"user_id": user_id, "delta_usd": delta_usd}
+        )
+    ).first()
+    return None if row is None else Decimal(row[0])
 
 
 # ---------------------------------------------------------------------------
@@ -943,3 +1023,89 @@ async def unreviewed_anomalous_payments(
         )
     ).mappings().all()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Rate-lock expiry (TZ 5.5, "Курс уехал между выставлением и оплатой")
+# ---------------------------------------------------------------------------
+
+#: Invoices whose quoted rate has gone stale **and which hold no money at all**.
+#:
+#: The second half of that sentence is the entire design of this query, so it is
+#: worth stating why rather than leaving it to be inferred from a ``NOT EXISTS``.
+#:
+#: TZ 5.5 gives two rules that overlap here. "Курс фиксируется в момент создания
+#: инвойса и действует ``rate_locked_until`` ... После — инвойс истекает" says a
+#: stale quote ends the invoice. "Окно доплаты живёт дольше самого инвойса,
+#: потому что человек, который уже отправил деньги, находится в другом
+#: положении, чем человек, который просто не заплатил" says a buyer who has
+#: already paid something keeps their invoice alive past its expiry.
+#:
+#: They only look contradictory. The rate lock protects *us* from quoting a price
+#: and being paid at it an hour later; the top-up window protects *the buyer* who
+#: is mid-payment. So the split is by whether money arrived: an invoice nobody
+#: paid expires when the quote goes stale, and an invoice holding money is left
+#: alone here and routed by :data:`SQL_INVOICES_PAST_TOPUP_WINDOW` — which sends
+#: it to ``manual_review``, not to ``expired``, because "деньги никогда не
+#: списываются молча по таймеру".
+#:
+#: Payments in *any* status count as money for this test, including
+#: ``ignored_dust`` and ``reverted``. Deliberately wider than the creditable set:
+#: this query decides whether a human should look, and an address that has seen a
+#: transfer is a different situation from one that never has, whatever the
+#: watcher made of it.
+SQL_INVOICES_PAST_RATE_LOCK = sa.text(
+    """
+    SELECT i.id,
+           i.user_id,
+           i.status::text     AS status,
+           i.rate_locked_until,
+           i.topup_window_until
+      FROM invoices i
+     WHERE i.status::text = ANY(:live_statuses)
+       AND now() > i.rate_locked_until
+       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.invoice_id = i.id)
+     ORDER BY i.rate_locked_until
+     LIMIT :limit
+    """
+).bindparams(sa.bindparam("live_statuses", type_=_TEXT_ARRAY))
+
+#: CAS, with both deadline and emptiness re-checked *inside* the UPDATE.
+#:
+#: The ``NOT EXISTS`` is repeated here rather than trusted from the SELECT
+#: because the gap between the two statements is exactly long enough for a
+#: payment to land: the watcher inserts into ``payments`` from its own
+#: transaction, and expiring an invoice that acquired money a millisecond ago
+#: would be the one failure mode this whole function exists to avoid.
+SQL_EXPIRE_INVOICE_PAST_RATE_LOCK = sa.text(
+    """
+    UPDATE invoices
+       SET status = CAST('expired' AS invoice_status)
+     WHERE id = :invoice_id
+       AND status::text = ANY(:expected)
+       AND now() > rate_locked_until
+       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.invoice_id = invoices.id)
+    """
+).bindparams(sa.bindparam("expected", type_=_TEXT_ARRAY))
+
+
+async def invoices_past_rate_lock(
+    conn: AsyncConnection, *, live_statuses: tuple[str, ...], limit: int = 500
+) -> list[dict[str, Any]]:
+    rows = (
+        await conn.execute(
+            SQL_INVOICES_PAST_RATE_LOCK,
+            {"live_statuses": list(live_statuses), "limit": limit},
+        )
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+async def expire_invoice_past_rate_lock(
+    conn: AsyncConnection, invoice_id: uuid.UUID, *, expected: tuple[str, ...]
+) -> bool:
+    result = await conn.execute(
+        SQL_EXPIRE_INVOICE_PAST_RATE_LOCK,
+        {"invoice_id": invoice_id, "expected": list(expected)},
+    )
+    return result.rowcount == 1

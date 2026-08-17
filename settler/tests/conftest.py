@@ -363,6 +363,51 @@ class World:
         self._hd_account_id = int(row.scalar_one())
         return self._hd_account_id
 
+    async def mark_funded(self, address_id: int) -> None:
+        """Money has arrived on this address (TZ 5.1 — ``ever_funded`` is forever).
+
+        Written as one UPDATE touching three columns because the CHECKs in
+        migration 0001 couple them: ``free_state_clean`` forbids ``ever_funded``
+        on a ``free`` row and ``funds_imply_ever_funded`` forbids a
+        ``first_seen_funds_at`` without the flag. Setting them one at a time
+        fails, which is the schema doing its job and not something a test helper
+        should have to rediscover.
+        """
+        await self._conn.execute(
+            sa.text(
+                """
+                UPDATE receive_addresses
+                   SET status = 'funded',
+                       ever_funded = true,
+                       first_seen_funds_at = COALESCE(first_seen_funds_at, now())
+                 WHERE id = :id
+                """
+            ),
+            {"id": address_id},
+        )
+
+    async def mark_swept(self, address_id: int) -> None:
+        """The owner moved the funds to cold storage offline (TZ 5.1).
+
+        In production this UPDATE is the deriver's — no other role may write
+        ``receive_addresses`` (TZ 5.8/T1.2). Here it is the test standing in for
+        the offline half of the sweep, which is the part that by design has no
+        code at all.
+        """
+        await self._conn.execute(
+            sa.text(
+                """
+                UPDATE receive_addresses
+                   SET status = 'swept',
+                       ever_funded = true,
+                       first_seen_funds_at = COALESCE(first_seen_funds_at, now()),
+                       swept_at = now()
+                 WHERE id = :id
+                """
+            ),
+            {"id": address_id},
+        )
+
     async def address(self, hd_account_id: int, *, index: int) -> tuple[int, str]:
         """A free pool address. Reservation happens once an invoice exists."""
         addr = _address(f"receive-{hd_account_id}-{index}")
@@ -393,6 +438,7 @@ class World:
         age: dt.timedelta = dt.timedelta(minutes=30),
         expires_in: dt.timedelta = dt.timedelta(minutes=15),
         topup_window: dt.timedelta = dt.timedelta(hours=24),
+        rate_lock: dt.timedelta | None = None,
         reserved_from_block: int = 0,
         policy_version: str = "test-policy",
     ) -> uuid.UUID:
@@ -403,10 +449,19 @@ class World:
         ``created_at`` has to be written explicitly because the CHECKs require
         ``created_at < expires_at <= topup_window_until``, so an expired invoice
         cannot be built by moving the deadline alone.
+
+        ``rate_lock`` is the offset of ``rate_locked_until`` from ``created_at``,
+        and defaults to ``expires_at`` — which is how invoices are issued in
+        practice, the quote and the invoice having the same life. It is a
+        separate knob because TZ 5.5 gives the two deadlines different jobs (see
+        :func:`settler.service.expire_stale_invoices`), and a test for the rate
+        lock that could only move it by moving the expiry would not be testing
+        the rate lock.
         """
         invoice_id = uuid.uuid4()
         created_at = dt.datetime.now(dt.UTC) - age
         expires_at = created_at + expires_in
+        rate_locked_until = expires_at if rate_lock is None else created_at + rate_lock
         await self._conn.execute(
             sa.text(
                 """
@@ -417,13 +472,14 @@ class World:
                                       public_token, policy_version)
                 VALUES (:id, :user_id, :product_id, :chain_id, :asset_id, :address_id,
                         :amount_due_raw, :amount_due_usd, :rate_snapshot,
-                        :expires_at, CAST(:status AS invoice_status), :expires_at,
+                        :rate_locked_until, CAST(:status AS invoice_status), :expires_at,
                         :topup_window_until, :created_at,
                         decode(:mac, 'hex'), :public_token, :policy_version)
                 """
             ),
             {
                 "id": invoice_id,
+                "rate_locked_until": rate_locked_until,
                 "user_id": user_id,
                 "product_id": product_id,
                 "chain_id": chain_id,
@@ -520,6 +576,7 @@ class World:
         topup_window: dt.timedelta = dt.timedelta(hours=24),
         age: dt.timedelta = dt.timedelta(minutes=30),
         expires_in: dt.timedelta = dt.timedelta(minutes=15),
+        rate_lock: dt.timedelta | None = None,
     ) -> Scenario:
         """The whole graph for the common case: one buyer, one invoice."""
         chain_id = await self.chain(
@@ -549,6 +606,7 @@ class World:
             topup_window=topup_window,
             age=age,
             expires_in=expires_in,
+            rate_lock=rate_lock,
         )
         return Scenario(
             chain_id=chain_id,
@@ -604,6 +662,24 @@ def counter_value(metric: object) -> float:
     for family in metric.collect():  # type: ignore[attr-defined]
         for sample in family.samples:
             if sample.name.endswith("_total") and not sample.labels:
+                return float(sample.value)
+    return 0.0
+
+
+def sample_value(metric: object, name_suffix: str = "", **labels: str) -> float:
+    """Current value of one labelled sample.
+
+    Same reasoning as :func:`counter_value` — read through ``collect()`` so the
+    assertion travels the path ``/metrics`` travels — extended to families with
+    labels, which is every metric the admin commands touch. Returns ``0.0`` for a
+    label combination that has never been observed, matching how Prometheus
+    itself treats an unseen child.
+    """
+    for family in metric.collect():  # type: ignore[attr-defined]
+        for sample in family.samples:
+            if name_suffix and not sample.name.endswith(name_suffix):
+                continue
+            if all(sample.labels.get(k) == v for k, v in labels.items()):
                 return float(sample.value)
     return 0.0
 

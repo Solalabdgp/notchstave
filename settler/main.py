@@ -13,9 +13,17 @@ What one pass does, in this order:
    before deciding anything else, or the same pass could grant access off a
    block that is already orphaned.
 2. **Settle candidates.** Invoices that are live and have money against them.
-3. **Sweep expired.** Windows that closed since the last pass.
-4. **Anomalies.** Payments that no invoice will ever ask about — chiefly
+3. **Expire stale quotes.** Unpaid invoices whose ``rate_locked_until`` has
+   passed (TZ 5.5). Touches nothing that holds money.
+4. **Sweep expired.** Top-up windows that closed since the last pass.
+5. **Anomalies.** Payments that no invoice will ever ask about — chiefly
    ``unassigned_payment``, which by definition has no invoice to settle.
+
+The owner-facing commands of TZ 3.4 — `/pending`, `/resolve`, `/sweeplist`,
+`/reconcile` — are **not** on this loop. They are in :mod:`settler.admin`,
+called on demand, because each of them is a decision a human takes rather than a
+state the database drifts into. `/reconcile` is the one that will eventually
+want a schedule; see the TODO at the end of :mod:`settler.admin.reconcile`.
 
 Not wired here (deliberately, with owners named):
 
@@ -125,6 +133,14 @@ async def run_once(settler: Settler, engine: AsyncEngine, *, batch: int = 200) -
         settlement = await settler.settle(invoice_id)
         log.info("invoice %s -> %s", invoice_id, settlement.outcome)
 
+    # Rate-lock expiry before the top-up sweep, and the order is not cosmetic:
+    # the rate pass only ever touches invoices with no payments, so running it
+    # first means an invoice that acquired money since the last tick is already
+    # excluded by the time the sweep decides between `expired` and
+    # `manual_review`. Reversing them would not corrupt anything — both are CAS —
+    # but it would make the log read as though the same invoice was considered
+    # twice under two different rules.
+    await settler.expire_stale()
     await settler.sweep_expired()
     await settler.review_anomalies()
 

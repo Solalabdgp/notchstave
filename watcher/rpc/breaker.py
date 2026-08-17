@@ -28,8 +28,9 @@ sleeping. Everything here is synchronous and allocation-free on the hot path:
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Final
+from typing import Final
 
 __all__ = [
     "BreakerState",

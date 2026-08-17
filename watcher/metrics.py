@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from core import metrics as core_metrics
+
 __all__ = [
     "PROMETHEUS_AVAILABLE",
     "head_lag_blocks",
@@ -139,17 +141,14 @@ active_reserved_addresses = Gauge(
     ["chain"],
 )
 
-orphan_payments_total = Counter(
-    "notchstave_orphan_payments_total",
-    "Payments mined below their address's reserved_from_block (TZ 5.8/T3.3).",
-    ["chain"],
-)
-
-unassigned_payments_total = Counter(
-    "notchstave_unassigned_payments_total",
-    "Payments to a known address with no live invoice behind it.",
-    ["chain"],
-)
+# Re-exported, not re-declared. These two families are incremented by the
+# watcher (which classifies the anomaly) and by the settler (which opens the
+# case), and the docstring at the top of this module is the reason that has to be
+# one collector rather than two: a name claimed twice raises DuplicateTimeseries
+# the moment a single process imports both packages, which is exactly what
+# `/reconcile` does since it reuses this package's RPC pool. See core/metrics.py.
+orphan_payments_total = core_metrics.orphan_payments_total
+unassigned_payments_total = core_metrics.unassigned_payments_total
 
 breaker_state = Gauge(
     "notchstave_rpc_breaker_state",

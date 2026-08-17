@@ -164,6 +164,8 @@ class FakeRpcClient(RpcClient):
         receipts: Mapping[str, dict[str, Any]] | None = None,
         head: int | None = None,
         finalized: int | None = None,
+        balances: Mapping[str, int] | None = None,
+        call_results: Mapping[str, str] | None = None,
     ) -> None:
         self.name = name
         self.blocks: dict[int, dict[str, Any]] = dict(blocks or {})
@@ -171,6 +173,15 @@ class FakeRpcClient(RpcClient):
         self.receipts: dict[str, dict[str, Any]] = dict(receipts or {})
         self._head = head
         self._finalized = finalized
+        #: `eth_getBalance` answers, keyed by lowercase address. Absent means
+        #: zero, exactly as a real node answers for an address it has never seen.
+        self.balances: dict[str, int] = {k.lower(): v for k, v in (balances or {}).items()}
+        #: `eth_call` answers, keyed by the `data` field of the call. Keyed on the
+        #: calldata rather than on `to` so that one fake can answer `balanceOf`
+        #: for several holders of the same token.
+        self.call_results: dict[str, str] = dict(call_results or {})
+        self.balance_calls: list[tuple[str, int | str]] = []
+        self.call_calls: list[dict[str, Any]] = []
         #: Every filter object this client was asked for, in order. The chunking
         #: tests assert on this rather than on the results, because "did not
         #: lose a payment" and "did not send one enormous request" are different
@@ -244,6 +255,22 @@ class FakeRpcClient(RpcClient):
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         return self.receipts.get(tx_hash)
 
+    async def get_balance(self, address: str, block: int | BlockTag = "latest") -> int:
+        self.balance_calls.append((address, block))
+        return self.balances.get(address.lower(), 0)
+
+    async def call(self, params: dict[str, Any], block: int | BlockTag = "latest") -> str:
+        self.call_calls.append(dict(params))
+        data = str(params.get("data", ""))
+        if data not in self.call_results:
+            # A node answers an unknown-but-valid `balanceOf` with 32 zero bytes,
+            # not with an error. Mirroring that is what makes "this address holds
+            # nothing" and "this fake was not told about the address"
+            # indistinguishable here — which is correct, because they are
+            # indistinguishable on chain too.
+            return "0x" + "00" * 32
+        return self.call_results[data]
+
     async def aclose(self) -> None:
         self.closed = True
 
@@ -284,7 +311,14 @@ class ScriptedRpcClient(RpcClient):
         return list(self._next())
 
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
-        return self._next()
+        result: dict[str, Any] | None = self._next()
+        return result
+
+    async def get_balance(self, address: str, block: int | BlockTag = "latest") -> int:
+        return int(self._next())
+
+    async def call(self, params: dict[str, Any], block: int | BlockTag = "latest") -> str:
+        return str(self._next())
 
     async def aclose(self) -> None:
         self.closed = True

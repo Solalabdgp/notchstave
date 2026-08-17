@@ -22,10 +22,14 @@ would be a test nobody runs.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from settler import repository as repo
+from settler.admin import repository as admin_repo
 from settler.policy import Outcome
 from settler.service import handle_reorg, settle_invoice
 from settler.tests.conftest import World, count, invoice_status
@@ -136,7 +140,25 @@ async def test_the_reorg_path_also_fits_inside_the_grant_matrix(
             "TZ 5.4 — a grant is revoked, never deleted; the role cannot delete at all",
         ),
         ("UPDATE products SET price_usd = 1", "the settler does not set prices"),
-        ("UPDATE users SET internal_balance_usd = 999", "see the Week 3 TODO on overpayment"),
+        # Migration 0003 grants UPDATE on exactly one column of `users`. These
+        # three are the proof that "exactly one" is enforced by PostgreSQL and
+        # not merely intended: `tg_id` in particular decides which human owns a
+        # purchase, and a settler able to rewrite it could move a product to a
+        # different person without touching `entitlements` at all.
+        ("UPDATE users SET lang = 'ru'", "migration 0003 grants one column, not the table"),
+        ("UPDATE users SET tg_id = 1", "a settler must never be able to reassign an account"),
+        (
+            "UPDATE users SET settings_json = '{}'::jsonb",
+            "column-level grants are per column, and this is not the column",
+        ),
+        (
+            "UPDATE sweep_exports SET total_raw = 0",
+            "0003 grants SELECT+INSERT: a record of what to sweep must not be revisable",
+        ),
+        (
+            "DELETE FROM sweep_exports",
+            "same reason as audit_log — the history of exports is the audit of the sweep",
+        ),
     ],
 )
 async def test_the_settler_role_is_refused_the_writes_it_must_not_have(
@@ -152,3 +174,119 @@ async def test_the_settler_role_is_refused_the_writes_it_must_not_have(
         assert "permission denied" in str(caught.value).lower(), why
     finally:
         await conn.execute(sa.text("RESET ROLE"))
+
+
+async def test_the_settler_may_credit_an_internal_balance_and_nothing_else_on_users(
+    conn: AsyncConnection, world: World
+) -> None:
+    """Migration 0003, both halves: the grant is sufficient *and* one column wide.
+
+    The Week 2 settler recorded a tolerated overpayment in the outbox and left
+    ``users.internal_balance_usd`` untouched, because migration 0002 gave it only
+    SELECT — a gap the settler agent flagged rather than closed by widening a
+    privilege. 0003 closes it with ``GRANT UPDATE (internal_balance_usd)``, and
+    this test is the reason that phrasing was chosen over the table-level grant:
+    the narrowing is checked, not asserted in a comment.
+    """
+    scenario = await world.scenario(amount_due_raw=10 * USDC)
+
+    await conn.execute(sa.text(f"SET LOCAL ROLE {SETTLER_ROLE}"))
+    try:
+        await repo.credit_internal_balance(
+            conn, user_id=scenario.user_id, delta_usd=Decimal("2.50")
+        )
+        with pytest.raises(sa.exc.ProgrammingError) as caught:
+            async with conn.begin_nested():
+                await conn.execute(
+                    sa.text("UPDATE users SET lang = 'ru' WHERE id = :id"),
+                    {"id": scenario.user_id},
+                )
+    finally:
+        await conn.execute(sa.text("RESET ROLE"))
+
+    assert "permission denied" in str(caught.value).lower()
+    balance = (
+        await conn.execute(
+            sa.text("SELECT internal_balance_usd FROM users WHERE id = :id"),
+            {"id": scenario.user_id},
+        )
+    ).scalar_one()
+    assert Decimal(balance) == Decimal("2.50")
+
+
+async def test_the_settler_may_record_a_sweep_export(
+    conn: AsyncConnection, world: World
+) -> None:
+    """0003's second grant. `/sweeplist` runs under this role, so it needs INSERT.
+
+    Migration 0002 gave ``sweep_exports`` to the bot on the assumption that the
+    bot builds the file. It does not: the bot is the surface of the admin
+    commands and the settler executes them, so that `/resolve credit` never
+    requires giving the bot process the power to grant an entitlement (TZ
+    5.8/T2, T7).
+    """
+    scenario = await world.scenario(amount_due_raw=10 * USDC)
+
+    await conn.execute(sa.text(f"SET LOCAL ROLE {SETTLER_ROLE}"))
+    try:
+        export_id, _generated_at = await admin_repo.record_sweep_export(
+            conn,
+            address_count=1,
+            total_raw=Decimal(10 * USDC),
+            asset_id=scenario.asset_id,
+            file_ref="grants.csv",
+            operator_id=770_001,
+        )
+    finally:
+        await conn.execute(sa.text("RESET ROLE"))
+
+    assert export_id > 0
+
+
+async def test_the_admin_path_fits_inside_the_settlers_privileges(
+    conn: AsyncConnection, world: World
+) -> None:
+    """`/resolve credit` under the settler role, end to end.
+
+    The sufficiency half of the matrix for the Week 3 additions, in the same
+    spirit as the settlement test at the top of this file: it covers UPDATE on
+    ``manual_reviews``, INSERT on ``entitlements`` / ``notifications`` /
+    ``audit_log``, UPDATE on ``invoices`` / ``payments``, and SELECT everywhere
+    the resolution reads. The failure mode it protects against — a privilege the
+    admin path needs and does not have — is invisible until a real owner runs a
+    real command in production.
+    """
+    import datetime as dt
+
+    from settler.admin.reviews import ResolutionOutcome, resolve_manual_review
+    from settler.policy import Outcome
+    from settler.service import settle_invoice
+
+    scenario = await world.scenario(
+        amount_due_raw=10 * USDC,
+        age=dt.timedelta(minutes=30),
+        expires_in=dt.timedelta(minutes=15),
+        topup_window=dt.timedelta(0),
+    )
+    await world.payment(
+        chain_id=scenario.chain_id,
+        asset_id=scenario.asset_id,
+        address_id=scenario.address_id,
+        invoice_id=scenario.invoice_id,
+        amount_raw=4 * USDC,
+        block_number=90,
+    )
+    opened = await settle_invoice(conn, scenario.invoice_id)
+    assert opened.outcome is Outcome.UNDERPAID_MANUAL_REVIEW
+    review_id = opened.manual_review_ids[0]
+
+    await conn.execute(sa.text(f"SET LOCAL ROLE {SETTLER_ROLE}"))
+    try:
+        result = await resolve_manual_review(
+            conn, review_id, "credit", 770_001, "granted under the settler role"
+        )
+    finally:
+        await conn.execute(sa.text("RESET ROLE"))
+
+    assert result.outcome is ResolutionOutcome.CREDITED
+    assert await invoice_status(conn, scenario.invoice_id) == "paid"

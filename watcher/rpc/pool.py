@@ -257,18 +257,46 @@ class RpcPool:
     async def get_block(
         self, block: int | BlockTag, *, full_transactions: bool = False
     ) -> dict[str, Any]:
-        return await self._run(
+        # Annotated intermediate rather than a bare `return await`: `_run` is
+        # deliberately `Any` (it forwards whatever the operation returns), and
+        # under mypy --strict an `Any` crossing a typed boundary is exactly what
+        # `no-any-return` exists to catch. Naming the type here is where the
+        # provider's untyped JSON becomes this project's typed value.
+        result: dict[str, Any] = await self._run(
             "eth_getBlockByNumber",
             lambda s: s.client.get_block(block, full_transactions=full_transactions),
         )
+        return result
 
     async def get_logs(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        return await self._run("eth_getLogs", lambda s: s.client.get_logs(params))
+        result: list[dict[str, Any]] = await self._run(
+            "eth_getLogs", lambda s: s.client.get_logs(params)
+        )
+        return result
 
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
-        return await self._run(
+        result: dict[str, Any] | None = await self._run(
             "eth_getTransactionReceipt", lambda s: s.client.get_transaction_receipt(tx_hash)
         )
+        return result
+
+    # ------------------------------------------------------------- balances --
+    #
+    # Read-only, and used only by the owner-facing reports of TZ 3.4
+    # (`/reconcile`, `/sweeplist`) through `settler.admin.balances`. They go
+    # through `_run` like everything else, which is the whole reason they are
+    # here rather than in a second client: the rotation, the circuit breaker,
+    # the backoff and the request budget of TZ 5.6 apply to a reconcile sweep
+    # exactly as they apply to indexing. A reconcile that hammered a rate-limited
+    # provider outside the budget would take the watcher down with it.
+
+    async def get_balance(self, address: str, *, block: int | BlockTag = "latest") -> int:
+        return int(
+            await self._run("eth_getBalance", lambda s: s.client.get_balance(address, block))
+        )
+
+    async def call(self, params: dict[str, Any], *, block: int | BlockTag = "latest") -> str:
+        return str(await self._run("eth_call", lambda s: s.client.call(params, block)))
 
     # ---------------------------------------------------------- chunked logs --
     async def get_logs_chunked(
@@ -393,7 +421,11 @@ class RpcPool:
                 block = await self._call_slot(
                     slot,
                     "eth_getBlockByNumber",
-                    lambda s, n=number: s.client.get_block(n, full_transactions=False),
+                    # `number` is a parameter of this method and never changes
+                    # inside the loop, so the usual late-binding default-argument
+                    # guard is unnecessary here — and it cost mypy the ability to
+                    # infer the lambda's type.
+                    lambda s: s.client.get_block(number, full_transactions=False),
                 )
             except RpcError:
                 answers[slot.name] = None

@@ -126,7 +126,7 @@ def test_walks_from_the_checkpoint_to_the_head_and_stores_a_linked_chain() -> No
     assert store.chain.last_indexed_block == 5
     # Every stored block points at the one below it.
     stored = sorted(store.blocks, key=lambda r: r["number"])
-    for lower, upper in zip(stored, stored[1:]):
+    for lower, upper in zip(stored, stored[1:], strict=False):
         assert upper["parent_hash"] == lower["hash"]
 
 

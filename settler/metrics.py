@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from prometheus_client import Counter, Gauge, Histogram
 
+from core import metrics as core_metrics
+
 __all__ = [
     "INVOICES_SETTLED",
     "REVERTED_CREDITS",
@@ -32,6 +34,9 @@ __all__ = [
     "UNASSIGNED_PAYMENTS",
     "MANUAL_REVIEW_OPEN",
     "PAYMENT_CREDIT_SECONDS",
+    "RECONCILE_DRIFT_USD",
+    "UNSWEPT_BALANCE_USD",
+    "ADMIN_ACTIONS",
 ]
 
 INVOICES_SETTLED = Counter(
@@ -50,17 +55,18 @@ DOUBLE_GRANT_BLOCKED = Counter(
     "Times entitlements_active_uniq stopped a second grant (TZ 5.8/T2.1).",
 )
 
-ORPHAN_PAYMENTS = Counter(
-    "notchstave_orphan_payments_total",
-    "Payments below reserved_from_block of a reused address (TZ 5.8/T3.3).",
-    ["chain"],
-)
+# The two families below are shared with the watcher and declared in
+# :mod:`core.metrics`, not here.
+#
+# The watcher classifies the anomaly from the block; the settler turns it into a
+# case a human reads, and TZ section 7's alert is about the second event. Both
+# increments are legitimate — but two `Counter(...)` calls for one name raise
+# `DuplicateTimeseries` as soon as one process imports both packages, which is
+# what `/reconcile` now does by reusing the watcher's RPC pool (TZ 5.6). One
+# declaration site, two callers.
+ORPHAN_PAYMENTS = core_metrics.orphan_payments_total
 
-UNASSIGNED_PAYMENTS = Counter(
-    "notchstave_unassigned_payments_total",
-    "Payments to a known address with no live invoice behind it (TZ 5.5).",
-    ["chain"],
-)
+UNASSIGNED_PAYMENTS = core_metrics.unassigned_payments_total
 
 MANUAL_REVIEW_OPEN = Gauge(
     "notchstave_manual_review_open",
@@ -71,4 +77,43 @@ PAYMENT_CREDIT_SECONDS = Histogram(
     "notchstave_payment_credit_seconds",
     "Seconds from first detection of a payment to the entitlement being granted.",
     buckets=(1, 5, 15, 30, 60, 120, 300, 900, 1800, 3600),
+)
+
+#: The most serious alert in the system (TZ section 7): "БД и цепь разошлись.
+#: Это баг в учёте денег, самое серьёзное, что может случиться."
+#:
+#: A Gauge and not a Counter, because the quantity is a *current* discrepancy
+#: that a later sweep or a late-indexed payment can legitimately close. A Counter
+#: would keep alerting about a drift that no longer exists, and an alert that
+#: stays red after the problem is fixed stops being read.
+#:
+#: Set by `settler.admin.reconcile` on every run, including runs that find
+#: nothing — writing an explicit zero is what distinguishes "reconciled, all
+#: square" from "reconcile has not run since the last restart", which look
+#: identical on a gauge that is only touched when something is wrong.
+RECONCILE_DRIFT_USD = Gauge(
+    "notchstave_reconcile_drift_usd",
+    "Absolute USD difference between confirmed payments in the ledger and "
+    "on-chain balances of the receive addresses holding them (TZ 3.4 /reconcile).",
+    ["chain"],
+)
+
+#: How much money is sitting on hot receive addresses right now (TZ section 7).
+#: Alert threshold is an operational decision, not a bug: "На горячих адресах
+#: скопилось слишком много. Пора свипать офлайн." Computed as a by-product of
+#: `/sweeplist`, which is the command whose whole purpose is answering it.
+UNSWEPT_BALANCE_USD = Gauge(
+    "notchstave_unswept_balance_usd",
+    "USD value on receive addresses that have been funded and not yet swept.",
+    ["chain"],
+)
+
+#: TZ 5.8/T7 — every owner action on money, by action. The point of the metric is
+#: not volume: it is that a captured owner account cannot act at a rate nobody
+#: can see. Pairs with the per-action notification the TZ requires and with the
+#: append-only `audit_log` rows.
+ADMIN_ACTIONS = Counter(
+    "notchstave_admin_actions_total",
+    "Owner actions on money, by action (TZ 3.4 admin commands, 5.8/T7).",
+    ["action"],
 )

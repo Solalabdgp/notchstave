@@ -48,12 +48,14 @@ Redis that is down and a lock that lies, and ``test_reorg.py`` is the "реор�
   surviving payment is reverted and needs `/reconcile` plus a manual review to
   come back. The fix is a column, i.e. a migration on a table this package does
   not own — see :data:`settler.repository.SQL_REVERT_PAYMENTS_IN_ORPHANED_BLOCKS`.
-* ``TODO(week3, grants)``: TZ 5.5 says a tolerated overpayment goes to the
-  user's internal balance, but migration 0002 gives the settler only SELECT on
-  ``users``. The amount is recorded in the outbox payload and in ``audit_log``,
-  and the balance is *not* written here. Either the grant matrix is wrong or
-  crediting belongs to the bot; that is a decision for whoever owns section 3.3,
-  not something to paper over by widening a privilege.
+* ``RESOLVED(week3, grants)``: the Week 2 note here said a tolerated
+  overpayment was never actually credited to ``users.internal_balance_usd``,
+  because migration 0002 gave the settler only SELECT on ``users``. Migration
+  0003 closes it with a **column-level** ``GRANT UPDATE (internal_balance_usd)``
+  — the privilege is exactly one column wide, PostgreSQL enforces it, and
+  ``settler/tests/test_grants.py`` asserts that every other column of ``users``
+  is still refused to this role. See the head of 0003 for why a table-level
+  grant and a ``SECURITY DEFINER`` function were both rejected.
 * ``TODO(week3, watcher contract)``: "finalized" is read as
   ``blocks.status = 'confirmed'`` — see :mod:`settler.confirmations` for the
   full reasoning and the cleaner alternative.
@@ -70,7 +72,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -78,6 +80,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from core.db import enums as E
 from settler import metrics
 from settler import repository as repo
+from settler.amounts import raw_to_usd, sum_raw
 from settler.confirmations import ConfirmationRule, creditable_cutoff_height, required_rule
 from settler.errors import InconsistentInvoice, InvoiceNotFound
 from settler.locks import InvoiceLock, NullLock
@@ -97,6 +100,7 @@ __all__ = [
     "settle_invoice",
     "handle_reorg",
     "sweep_expired_invoices",
+    "expire_stale_invoices",
     "review_anomalous_payments",
     "LIVE_INVOICE_STATUSES",
     "SETTLED_INVOICE_STATUSES",
@@ -151,6 +155,33 @@ _ANOMALY_REVIEW_KIND: dict[str, str] = {
 }
 
 _ACTOR_ID = "settler"
+
+#: Scale of ``users.internal_balance_usd`` — ``NUMERIC(18, 6)`` from migration
+#: 0001. Named here because the rounding direction below is a money decision, not
+#: a formatting detail.
+_USD_QUANTUM = Decimal("0.000001")
+
+
+def _creditable_usd(raw: Decimal, decimals: int, rate: Decimal) -> Decimal:
+    """Excess in base units -> the USD figure actually written to a balance.
+
+    Rounded **down** to the scale of the column. Two reasons, and the second is
+    the one that matters:
+
+    * rounding up would credit a buyer a fraction of a cent nobody sent, which
+      makes ``/reconcile`` — the check that the ledger matches the chain —
+      report a drift that is really an artefact of our own arithmetic;
+    * the column is ``NUMERIC(18, 6)``, so PostgreSQL rounds *half-up* on insert
+      if the application does not round first. Leaving it to the database means
+      the credited figure and the figure in the notification and the audit row
+      can differ in the last digit, and "the message said one thing and the
+      ledger says another" is the single worst sentence in a payment system.
+
+    A one-wei excess on an expensive token can round to zero here. That is the
+    correct answer — there is no representable amount to credit — and the caller
+    records the raw excess in the audit trail either way, so nothing is lost.
+    """
+    return raw_to_usd(raw, decimals, rate).quantize(_USD_QUANTUM, rounding=ROUND_FLOOR)
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +291,7 @@ async def settle_invoice(
         and p.chain_id == ctx.chain_id
         and (p.anomaly is None or p.anomaly in CREDITABLE_ANOMALIES)
     ]
-    candidate_total = sum((p.amount_raw for p in candidates), Decimal(0))
+    candidate_total = sum_raw(p.amount_raw for p in candidates)
 
     if candidate_total <= 0:
         return SettlementResult(
@@ -531,19 +562,59 @@ async def _apply_settlement(
         notifications.append(notification_id)
 
     if decision.outcome is Outcome.OVERPAID_CREDITED:
-        # TZ 5.5: the excess is credited to the user's internal balance and the
-        # user is told in plain words. See TODO(week3, grants) in the module
-        # docstring for why the balance column is not written here.
+        # TZ 5.5: the excess goes to the user's internal balance and the user is
+        # told in plain words. "Тихо оставлять себе чужие деньги нельзя."
+        #
+        # The outbox insert is deliberately *first* and is the idempotency gate
+        # for the credit that follows. A balance is the one figure in this
+        # package that cannot be recomputed from the ledger — there is no ledger
+        # of balances to re-sum — so the increment has to be protected by
+        # something, and ``UNIQUE (kind, ref_id, dedup_key)`` on ``notifications``
+        # is a guarantee that already exists and is already tested. A `None` here
+        # means this exact (invoice, grant) pair was credited before, and the
+        # balance is left alone.
+        #
+        # Both statements are in the settler's transaction, so a rollback takes
+        # the outbox row and the balance together: there is no window in which
+        # the guard exists without the credit it guards.
+        excess_usd = _creditable_usd(decision.excess_raw, ctx.asset_decimals, ctx.rate_snapshot)
         extra = await repo.enqueue_notification(
             conn,
             user_id=ctx.user_id,
             kind="overpaid_credited",
             ref_id=str(ctx.invoice_id),
             dedup_key=str(entitlement_id),
-            payload={**payload, "credited_excess_raw": str(decision.excess_raw)},
+            payload={
+                **payload,
+                "credited_excess_raw": str(decision.excess_raw),
+                "credited_excess_usd": str(excess_usd),
+            },
         )
         if extra is not None:
             notifications.append(extra)
+            new_balance = (
+                await repo.credit_internal_balance(
+                    conn, user_id=ctx.user_id, delta_usd=excess_usd
+                )
+                if excess_usd > 0
+                else None
+            )
+            await repo.write_audit(
+                conn,
+                actor_id=actor_id,
+                action="settle.internal_balance_credited",
+                target_kind="user",
+                target_id=str(ctx.user_id),
+                before_state={"invoice_id": str(ctx.invoice_id)},
+                after_state={"internal_balance_usd": str(new_balance)},
+                args={
+                    "excess_raw": str(decision.excess_raw),
+                    "excess_usd": str(excess_usd),
+                    "rate_snapshot": str(ctx.rate_snapshot),
+                    "notification_id": extra,
+                },
+                policy_version=policy.version,
+            )
 
     if decision.outcome is Outcome.OVERPAID_REFUND_PENDING:
         sender = next((p.sender for p in candidates if p.sender), None)
@@ -934,6 +1005,99 @@ async def sweep_expired_invoices(
     return moved
 
 
+async def expire_stale_invoices(
+    conn: AsyncConnection,
+    *,
+    policy: MoneyPolicy = DEFAULT_POLICY,
+    actor_id: str = _ACTOR_ID,
+    limit: int = 500,
+) -> tuple[uuid.UUID, ...]:
+    """Expire invoices whose quoted rate has gone stale (TZ 5.5, rate table).
+
+    "Курс фиксируется в момент создания инвойса (``rate_snapshot``) и действует
+    ``rate_locked_until`` (по умолчанию 15 минут). После — инвойс истекает. Для
+    USDC вопрос вырожденный, для ETH — основной."
+
+    That last sentence is why this exists as its own pass rather than as a line
+    in :func:`sweep_expired_invoices`. The two deadlines are different
+    quantities protecting different parties:
+
+    * ``rate_locked_until`` (minutes) protects **us**. Its job is to stop
+      somebody quoting an ETH price, waiting for the market to move, and paying
+      the stale number. Without this pass a live invoice would keep its quote
+      indefinitely, because ``sweep_expired_invoices`` only looks at
+      ``topup_window_until`` — a deadline a full day later.
+    * ``topup_window_until`` (a day past expiry) protects **the buyer** who has
+      already sent money and is mid-payment.
+
+    So this function deliberately touches **only invoices with no payment rows at
+    all**. An invoice holding money keeps its quote until the top-up window
+    closes, and is then routed by :func:`sweep_expired_invoices` to
+    ``manual_review`` rather than to ``expired``, because money is never written
+    off by a timer. The emptiness test is re-checked inside the UPDATE — see
+    :data:`settler.repository.SQL_EXPIRE_INVOICE_PAST_RATE_LOCK` for why the gap
+    between the SELECT and the UPDATE is long enough to matter.
+
+    Scheduling: this is the same shape as the other sweeps — a pass over
+    database state, driven by :func:`settler.main.run_once` on the settler's own
+    poll loop. Not Celery beat, and that is the project's existing decision
+    rather than a new one: ``settler/main.py`` runs a poll loop precisely
+    because every settler action is a function of database state, so a missed
+    tick costs latency and nothing else. A beat scheduler would add a broker, a
+    second deployment unit and a lost-schedule failure mode to a job whose worst
+    case is "an unpaid invoice expires thirty seconds late".
+    """
+    rows = await repo.invoices_past_rate_lock(
+        conn, live_statuses=LIVE_INVOICE_STATUSES, limit=limit
+    )
+
+    expired: list[uuid.UUID] = []
+    for row in rows:
+        invoice_id = row["id"]
+        if not await repo.expire_invoice_past_rate_lock(
+            conn, invoice_id, expected=LIVE_INVOICE_STATUSES
+        ):
+            # Lost the CAS, or money landed between the two statements. Either
+            # way this invoice is somebody else's problem now.
+            continue
+        expired.append(invoice_id)
+
+        await repo.enqueue_notification(
+            conn,
+            user_id=int(row["user_id"]),
+            kind="invoice_expired",
+            ref_id=str(invoice_id),
+            # Keyed on the reason: a later expiry of the same invoice is
+            # impossible (``expired`` is terminal), so one message per invoice is
+            # the whole requirement.
+            dedup_key="rate_lock",
+            payload={
+                "invoice_id": str(invoice_id),
+                "reason": "rate_lock_expired",
+                "rate_locked_until": row["rate_locked_until"],
+                "policy_version": policy.version,
+            },
+        )
+        await repo.write_audit(
+            conn,
+            actor_id=actor_id,
+            action="sweep.rate_lock_expired",
+            target_kind="invoice",
+            target_id=str(invoice_id),
+            before_state={"status": row["status"]},
+            after_state={"status": str(E.InvoiceStatus.EXPIRED)},
+            args={
+                "rate_locked_until": str(row["rate_locked_until"]),
+                "topup_window_until": str(row["topup_window_until"]),
+                "had_payments": False,
+            },
+            policy_version=policy.version,
+        )
+        metrics.INVOICES_SETTLED.labels(outcome=str(E.InvoiceStatus.EXPIRED)).inc()
+
+    return tuple(expired)
+
+
 async def review_anomalous_payments(
     conn: AsyncConnection,
     *,
@@ -1026,6 +1190,12 @@ class Settler:
     async def sweep_expired(self) -> dict[uuid.UUID, str]:
         async with self._engine.begin() as conn:
             return await sweep_expired_invoices(
+                conn, policy=self._policy, actor_id=self._actor_id
+            )
+
+    async def expire_stale(self) -> tuple[uuid.UUID, ...]:
+        async with self._engine.begin() as conn:
+            return await expire_stale_invoices(
                 conn, policy=self._policy, actor_id=self._actor_id
             )
 

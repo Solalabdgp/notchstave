@@ -11,12 +11,29 @@ same pattern here, and the payoff is the same in both directions:
 * the tests replay saved provider payloads through a fake implementing this
   ABC, so the whole traversal and detection stack runs with no network at all.
 
-The method set is deliberately small. Everything the watcher needs is here and
-nothing else is: no `eth_call`, no `send_raw_transaction`, no account access.
-That is not minimalism for its own sake — TZ section 12 and the architectural
-test in TZ section 8 require that this codebase contain no code path capable of
-signing or broadcasting a transaction, and a client interface that cannot
-express one is the cheapest way to keep that true as the code grows.
+The method set is deliberately small: no `send_raw_transaction`, no account
+access, no signing. That is not minimalism for its own sake — TZ section 12 and
+the architectural test in TZ section 8 require that this codebase contain no
+code path capable of signing or broadcasting a transaction, and a client
+interface that cannot express one is the cheapest way to keep that true as the
+code grows.
+
+**Week 3 addition, and why it does not weaken the rule above.** `/reconcile`
+and `/sweeplist` (TZ 3.4) need the *actual* balance of a receive address, which
+is `eth_getBalance` for a native coin and an `eth_call` of `balanceOf` for an
+ERC-20. Both are read-only JSON-RPC methods: neither takes a signature, neither
+changes state, and a node serving them over a public HTTPS endpoint cannot be
+made to move a coin by them. The invariant the architectural test protects is
+"nothing here can sign or broadcast", not "nothing here can read", and
+`/reconcile` is the check that catches the case where the ledger and the chain
+have silently diverged — the most serious alert in TZ section 7. Refusing to
+read balances in order to keep the interface small would mean the system cannot
+audit its own books, which is a strictly worse trade.
+
+They live on this ABC rather than in a second client next to the settler for
+the reason TZ 5.6 gives: one pool, one rotation, one circuit breaker, one
+request budget. A second HTTP path to the same providers would be outside all
+four.
 """
 
 from __future__ import annotations
@@ -100,8 +117,47 @@ class RpcClient(ABC):
         success.
         """
 
-    async def aclose(self) -> None:
-        """Release connection-level resources."""
+    @abstractmethod
+    async def get_balance(self, address: str, block: int | BlockTag = "latest") -> int:
+        """`eth_getBalance` — native-coin balance of `address`, in wei.
+
+        Read-only. Used by `/reconcile` and `/sweeplist` (TZ 3.4) and by nothing
+        in the indexing path: the watcher detects payments from logs and blocks,
+        never from balances, because a balance is a state and a payment is an
+        event.
+
+        Raises:
+            RpcError: transport failure, or a non-hex answer.
+        """
+
+    @abstractmethod
+    async def call(self, params: dict[str, Any], block: int | BlockTag = "latest") -> str:
+        """`eth_call` — evaluate a read-only contract call, returning raw hex data.
+
+        `params` is the transaction object (`{"to": ..., "data": ...}`) built by
+        the caller, for the same reason `get_logs` takes an assembled filter: the
+        exact object sent to the node is then a value a test can assert on.
+
+        Only ever used with `balanceOf(address)` (see
+        `settler.admin.balances`). `eth_call` executes against a *pending* state
+        copy inside the node and cannot produce a transaction — it is the
+        read half of the contract ABI, not the write half.
+
+        Raises:
+            RpcError: transport failure, a revert, or a non-hex answer.
+        """
+
+    async def aclose(self) -> None:  # noqa: B027 - see below
+        """Release connection-level resources.
+
+        Concrete, empty and deliberately **not** abstract, which is what B027
+        flags. A client that holds no connection — the scripted doubles in
+        ``tests/watcher/fakes.py``, or a future in-process client — has nothing
+        to release, and forcing every implementation to write ``pass`` buys no
+        safety while making the ABC harder to implement correctly. Leaking a real
+        connection pool is caught by the implementation's own tests, not by a
+        decorator.
+        """
 
     async def __aenter__(self) -> RpcClient:
         return self

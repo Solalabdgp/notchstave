@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from watcher.rpc.breaker import BreakerPolicy, CircuitBreaker, RequestBudget
-from watcher.rpc.client import ProviderSlot, RpcClient
+from watcher.rpc.client import ProviderSlot
 from watcher.rpc.pool import ChunkPolicy, RetryPolicy, RpcPool
 from watcher.store.base import ChainConfigRow
 from watcher.traversal import TraversalSettings

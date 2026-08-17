@@ -181,7 +181,7 @@ def parse_block_header(raw: Mapping[str, Any], *, keep_raw: bool = False) -> Blo
         number=number,
         hash=block_hash,
         parent_hash=parent_hash,
-        timestamp=dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc),
+        timestamp=dt.datetime.fromtimestamp(timestamp, tz=dt.UTC),
         raw=dict(raw) if keep_raw else None,
     )
 
@@ -560,7 +560,7 @@ class ChainWalker:
         age of the block rather than the latency of detection, dragging the
         histogram towards the length of whatever re-walk produced it.
         """
-        now = dt.datetime.now(tz=dt.timezone.utc)
+        now = dt.datetime.now(tz=dt.UTC)
         for event in result.inserted:
             header = headers_by_number.get(event.block_number)
             if header is None:  # pragma: no cover - events come from these headers
