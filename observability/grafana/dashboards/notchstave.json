@@ -1,0 +1,364 @@
+{
+  "id": null,
+  "uid": "notchstave-overview",
+  "title": "Notchstave",
+  "description": "TZ section 7 dashboard: chain health, money flow, and the security block kept separate because normal is zero for almost everything in it.",
+  "tags": ["notchstave"],
+  "timezone": "utc",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "chain",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+        "query": { "query": "label_values(notchstave_head_lag_blocks, chain)", "refId": "chain" },
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    { "id": 900, "type": "row", "title": "Overview", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false, "panels": [] },
+
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Reconcile drift (USD)",
+      "description": "notchstave_reconcile_drift_usd — TZ section 7's most serious alert. Zero except while /reconcile is actively wrong.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "sum(notchstave_reconcile_drift_usd{chain=~\"$chain\"})", "legendFormat": "drift", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "red", "value": 1 }
+          ] }
+        }, "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Unswept balance (USD)",
+      "description": "notchstave_unswept_balance_usd — money sitting on hot receive addresses.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "sum(notchstave_unswept_balance_usd{chain=~\"$chain\"})", "legendFormat": "unswept", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "orange", "value": 500 }
+          ] }
+        }, "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Manual reviews open",
+      "description": "notchstave_manual_review_open — TZ 3.4 /pending.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "notchstave_manual_review_open", "legendFormat": "open", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "orange", "value": 10 }
+          ] }
+        }, "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "DLQ size",
+      "description": "notchstave_dlq_size — notifier. Owner: notifier process; will read \"No data\" until it exposes /metrics (see prometheus.yml comment).",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "notchstave_dlq_size", "legendFormat": "dead-lettered", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "orange", "value": 1 }
+          ] }
+        }, "overrides": []
+      }
+    },
+
+    { "id": 901, "type": "row", "title": "Chain health", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }, "collapsed": false, "panels": [] },
+
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Head lag (blocks)",
+      "description": "notchstave_head_lag_blocks{chain} — watcher's distance from chain head. Alert: NotchstaveHeadLagAbsolute / NotchstaveHeadLagGrowing.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "notchstave_head_lag_blocks{chain=~\"$chain\"}", "legendFormat": "chain {{chain}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Reorgs (rate, by depth)",
+      "description": "notchstave_reorgs_total{chain,depth} — TZ 5.4.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "sum by (chain, depth) (rate(notchstave_reorgs_total{chain=~\"$chain\"}[5m]))", "legendFormat": "chain {{chain}} depth {{depth}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "RPC errors (rate, by provider)",
+      "description": "notchstave_rpc_errors_total{provider,chain}.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "sum by (provider, chain) (rate(notchstave_rpc_errors_total{chain=~\"$chain\"}[5m]))", "legendFormat": "{{provider}} / chain {{chain}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "RPC budget spend (requests/sec, by provider+method)",
+      "description": "notchstave_rpc_requests_total{provider,method}.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "sum by (provider, method) (rate(notchstave_rpc_requests_total[5m]))", "legendFormat": "{{provider}} / {{method}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Circuit breaker state (0 closed / 1 half-open / 2 open)",
+      "description": "notchstave_rpc_breaker_state{provider,chain} — not in TZ section 7's list, added by the watcher so head_lag alerts can be attributed to a provider.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "notchstave_rpc_breaker_state{chain=~\"$chain\"}", "legendFormat": "{{provider}} / chain {{chain}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 2 }, "overrides": [] }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Provider disagreement (rate)",
+      "description": "notchstave_provider_disagreement_total{chain} — TZ 5.6 cross-check.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "sum by (chain) (rate(notchstave_provider_disagreement_total{chain=~\"$chain\"}[15m]))", "legendFormat": "chain {{chain}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    },
+
+    { "id": 902, "type": "row", "title": "Money flow", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 }, "collapsed": false, "panels": [] },
+
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Invoices settled (rate, by outcome)",
+      "description": "notchstave_invoices_settled_total{outcome} — paid / underpaid_tolerated / overpaid_credited / expired / manual.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "sum by (outcome) (rate(notchstave_invoices_settled_total[15m]))", "legendFormat": "{{outcome}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Reverted credits (1h)",
+      "description": "notchstave_reverted_credits_total — entitlements revoked by a reorg. Alert: NotchstaveRevertedCreditsGrew.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "increase(notchstave_reverted_credits_total[1h])", "legendFormat": "reverted", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+          { "color": "green", "value": null }, { "color": "red", "value": 1 }
+        ] } }, "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Payment detect latency (p50 / p95 / p99)",
+      "description": "notchstave_payment_detect_seconds — block timestamp to row committed. Lower bound is chain block time, not zero.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(notchstave_payment_detect_seconds_bucket[15m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(notchstave_payment_detect_seconds_bucket[15m])))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(notchstave_payment_detect_seconds_bucket[15m])))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Payment-to-credit latency (p50 / p95 / p99)",
+      "description": "notchstave_payment_credit_seconds — first detection to entitlement granted (settler.service._apply_settlement).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(notchstave_payment_credit_seconds_bucket[15m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(notchstave_payment_credit_seconds_bucket[15m])))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(notchstave_payment_credit_seconds_bucket[15m])))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+
+    {
+      "id": 903,
+      "type": "row",
+      "title": "Security (TZ 5.8) — normal is zero for almost every panel here",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
+      "collapsed": false,
+      "panels": []
+    },
+
+    {
+      "id": 30,
+      "type": "stat",
+      "title": "Address mismatch (24h)",
+      "description": "notchstave_address_mismatch_total — T1. Normal is always zero. Not yet emitted (Week 5, deriver.verify) — reads \"No data\" until then, not a false green.",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [ { "expr": "increase(notchstave_address_mismatch_total[24h])", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 1 }
+      ] } }, "overrides": [] }
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "Invoice MAC failures (24h)",
+      "description": "notchstave_invoice_mac_failures_total — T1. Normal is always zero. Week 5 (invoice HMAC).",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [ { "expr": "increase(notchstave_invoice_mac_failures_total[24h])", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 1 }
+      ] } }, "overrides": [] }
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Orphan payments (24h)",
+      "description": "notchstave_orphan_payments_total{chain} — T3, reused address outside its reservation window.",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [ { "expr": "sum(increase(notchstave_orphan_payments_total{chain=~\"$chain\"}[24h]))", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "orange", "value": 1 }
+      ] } }, "overrides": [] }
+    },
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "Unassigned payments (24h)",
+      "description": "notchstave_unassigned_payments_total{chain} — money on a known address with no live invoice.",
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [ { "expr": "sum(increase(notchstave_unassigned_payments_total{chain=~\"$chain\"}[24h]))", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "orange", "value": 1 }
+      ] } }, "overrides": [] }
+    },
+    {
+      "id": 34,
+      "type": "stat",
+      "title": "Double grant blocked (24h)",
+      "description": "notchstave_double_grant_blocked_total — T2. Nonzero is the unique index working, not an outage — the alert (NotchstaveDoubleGrantBlockedFiring) only fires on a sustained rate.",
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [ { "expr": "increase(notchstave_double_grant_blocked_total[24h])", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "blue", "value": null }
+      ] } }, "overrides": [] }
+    },
+    {
+      "id": 35,
+      "type": "stat",
+      "title": "Invoice ratelimit hits (24h)",
+      "description": "notchstave_invoice_ratelimit_hits_total{scope} — T5 quotas. Week 5 scope, not yet emitted.",
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [ { "expr": "sum(increase(notchstave_invoice_ratelimit_hits_total[24h]))", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "orange", "value": 20 }
+      ] } }, "overrides": [] }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Active reserved addresses (T5 gap-limit pressure)",
+      "description": "notchstave_active_reserved_addresses{chain} — compare against hd_accounts.max_active_addresses, not exported as a metric yet (see alerts.yml header).",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "notchstave_active_reserved_addresses{chain=~\"$chain\"}", "legendFormat": "chain {{chain}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "eth_getLogs filter size",
+      "description": "notchstave_getlogs_filter_size{chain} — leading indicator of detection degradation (T5).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "notchstave_getlogs_filter_size{chain=~\"$chain\"}", "legendFormat": "chain {{chain}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Admin actions (rate, by action)",
+      "description": "notchstave_admin_actions_total{action} — T7. A captured owner account cannot act at a rate nobody can see.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 62 },
+      "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
+      "targets": [
+        { "expr": "sum by (action) (rate(notchstave_admin_actions_total[1h]))", "legendFormat": "{{action}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    }
+  ]
+}

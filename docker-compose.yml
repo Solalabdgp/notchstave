@@ -1,16 +1,34 @@
 # Notchstave — local dev compose (TZ section 9).
 #
-# Postgres + Redis are real, working services this week. Prometheus/Grafana
-# are commented out on purpose: Week 1 scope is "one network, one asset,
-# end-to-end path works" (TZ section 11), not observability. Full prod config
-# for the monitoring stack — dashboards, alert rules, retention — comes with
-# Week 4 ("reliability": metrics, dashboard, alerts).
+# Postgres + Redis are real, working services. Prometheus and Grafana joined
+# them in Week 4 ("reliability": metrics, dashboard, alerts, TZ section 11) —
+# they were commented out through Week 3 because there was nothing real to
+# scrape yet.
+#
+# watcher, settler, notifier, bot and api are deliberately NOT services here:
+# TZ section 4 runs them as one systemd unit each in production, and in local
+# dev they are run directly on the host (`python -m watcher.main --chain-id
+# 8453`, etc. — see README). That is also why Prometheus needs
+# `host.docker.internal` targets (see observability/prometheus/prometheus.yml)
+# rather than compose service-name DNS: the processes it scrapes are not
+# members of this compose network.
 #
 # Secrets: every credential below is a placeholder read from .env (see
 # .env.example). Real secrets never go in this file and never go in git
 # (TZ section 9). In production, secrets are delivered via systemd
 # LoadCredential=/files with 600 perms, not via docker-compose env vars —
 # this compose file is for local dev only.
+#
+# `name:` below is deliberate, not decoration: neither this file nor
+# docker-compose.test.yml declared one before, so both fell back to Compose's
+# default project name (the directory name, "notchstave") and shared one
+# namespace. A `docker compose down` run against this file was silently also a
+# `down` for the *test* stack's containers — discovered the hard way while
+# building this section, when it took out `notchstave-test-pg` and
+# `notchstave-test-redis`. Giving each file its own project name makes `up`/
+# `down` here provably unable to touch the test rig's containers, instead of
+# relying on every future invocation remembering to scope its `-f` flag.
+name: notchstave-dev
 
 services:
   postgres:
@@ -46,33 +64,53 @@ services:
       timeout: 5s
       retries: 10
 
-  # --- Observability stack — placeholder only, not required to run this week ---
-  # Full config (scrape targets for bot/api/watcher/settler/notifier, Grafana
-  # dashboards/provisioning, alert rules) lands in Week 4 (TZ section 11:
-  # "reliability" — pool RPC, circuit breaker, backoff, DLQ, metrics,
-  # dashboard, alerts).
-  #
-  # prometheus:
-  #   image: prom/prometheus:latest
-  #   restart: unless-stopped
-  #   volumes:
-  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-  #     - notchstave_prometheus_data:/prometheus
-  #   ports:
-  #     - "127.0.0.1:9090:9090"
-  #
-  # grafana:
-  #   image: grafana/grafana:latest
-  #   restart: unless-stopped
-  #   environment:
-  #     GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
-  #   volumes:
-  #     - notchstave_grafana_data:/var/lib/grafana
-  #   ports:
-  #     - "127.0.0.1:3000:3000"
+  # --- Observability stack (TZ section 7/11, Week 4) -------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - notchstave_prometheus_data:/prometheus
+    ports:
+      # Local dev only, same rule as Postgres/Redis above — not for a public
+      # interface in production.
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      # Docker Desktop (Windows/Mac) resolves host.docker.internal on its own;
+      # this line is what makes the identical prometheus.yml also work
+      # unmodified on the Linux Hetzner deploy (TZ section 9), where it does
+      # not exist by default.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      # No sign-up, no anonymous access: this dashboard shows unswept balances
+      # and reconcile drift, which is financial data even in a portfolio demo.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Separate top-level mount, not nested under the one above: Docker
+      # cannot create a mountpoint inside an already-read-only bind mount (see
+      # observability/grafana/provisioning/dashboards/dashboards.yml).
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - notchstave_grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
 
 volumes:
   notchstave_postgres_data:
   notchstave_redis_data:
-  # notchstave_prometheus_data:
-  # notchstave_grafana_data:
+  notchstave_prometheus_data:
+  notchstave_grafana_data:

@@ -1,0 +1,25 @@
+# Notchstave — Grafana dashboard provisioning (TZ section 7).
+#
+# Points Grafana at the JSON model in ../../dashboards/. Editing that JSON
+# file and restarting the grafana container is how the dashboard is meant to
+# change — not editing in the UI and forgetting to export, which is how a
+# project ends up with a dashboard that only exists on one laptop.
+
+apiVersion: 1
+
+providers:
+  - name: notchstave
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      # Deliberately NOT nested under /etc/grafana/provisioning — that whole
+      # tree is mounted read-only from ../.. (this file's own directory), and
+      # Docker cannot create a second mountpoint inside a read-only mount (the
+      # dashboard JSON needs its own top-level mount in docker-compose.yml:
+      # ./observability/grafana/dashboards -> /var/lib/grafana/dashboards).
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

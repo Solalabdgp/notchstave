@@ -69,6 +69,7 @@ Redis that is down and a lock that lies, and ``test_reorg.py`` is the "реор�
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -535,6 +536,20 @@ async def _apply_settlement(
             confirmation_rule=rule,
             lost_grant_race=True,
         )
+
+    # TZ section 7 — `notchstave_payment_credit_seconds`: "от первого
+    # обнаружения до выдачи доступа". `candidates` carries `created_at` from the
+    # same `payments` rows the credit decision above was made from, so this is
+    # the earliest detection among the payments that actually paid for *this*
+    # grant, not the invoice's oldest payment (which might be an anomaly that
+    # never counted, e.g. `wrong_chain`).
+    credited_detected_at = [p.created_at for p in candidates if p.id in credited]
+    if credited_detected_at:
+        earliest = min(credited_detected_at)
+        # `TS = DateTime(timezone=True)` (core/db/models.py) — every row read
+        # back through psycopg is tz-aware, so this is always an aware diff.
+        elapsed = (dt.datetime.now(dt.UTC) - earliest).total_seconds()
+        metrics.PAYMENT_CREDIT_SECONDS.observe(max(0.0, elapsed))
 
     payload: dict[str, Any] = {
         "invoice_id": str(ctx.invoice_id),

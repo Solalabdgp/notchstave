@@ -145,6 +145,12 @@ class PaymentRow:
     status: str
     anomaly: str | None
     confirmations_at_credit: int | None
+    #: TZ section 7 — ``notchstave_payment_credit_seconds`` measures from this
+    #: timestamp (first detection, written by the watcher on insert) to the
+    #: entitlement's ``granted_at``. Added here, not derived elsewhere, so the
+    #: histogram reads the same row the credit decision was made from rather
+    #: than a second, possibly-stale query.
+    created_at: dt.datetime
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +234,7 @@ SQL_INVOICE_PAYMENTS = sa.text(
     """
     SELECT p.id, p.chain_id, p.tx_hash, p.log_index, p.block_number, p.asset_id,
            p.amount_raw, p.sender, p.status::text AS status,
-           p.anomaly::text AS anomaly, p.confirmations_at_credit
+           p.anomaly::text AS anomaly, p.confirmations_at_credit, p.created_at
       FROM payments p
      WHERE p.invoice_id = :invoice_id
      ORDER BY p.block_number, p.log_index, p.id
@@ -296,6 +302,7 @@ async def invoice_payments(conn: AsyncConnection, invoice_id: uuid.UUID) -> list
             status=r["status"],
             anomaly=r["anomaly"],
             confirmations_at_credit=r["confirmations_at_credit"],
+            created_at=r["created_at"],
         )
         for r in rows
     ]

@@ -1,0 +1,242 @@
+# Notchstave — Prometheus alert rules (TZ section 7).
+#
+# Every row of the TZ section 7 alert table has a rule below, in the same
+# order, each rule's `annotations.tz_reason` quoting the "почему" column
+# verbatim so the alert and the spec never drift apart. A few rules reference
+# metrics nothing in this codebase writes yet (`notchstave_address_mismatch_total`,
+# `notchstave_invoice_mac_failures_total`, `notchstave_invoice_ratelimit_hits_total`
+# — all three are Week 5 scope per TZ section 11: HMAC, `/verify`, invoice
+# quotas). They are wired here anyway, not as a claim they are live: an absent
+# metric simply never crosses `> 0` and the rule stays permanently green,
+# which is the correct, honest state for "not built yet" — and it means Week 5
+# does not also owe a forgotten alert rule.
+#
+# Two rules could not be expressed as literally as the table states them and
+# say so in their own annotation:
+#   * `active_reserved_addresses > 80% потолка` — the ceiling
+#     (`hd_accounts.max_active_addresses`) is not exported as a metric, so the
+#     rule below compares against a fixed placeholder instead of a true ratio.
+#   * `head_lag_blocks растёт` — "grows" is a trend, not a level. The rule
+#     below alerts on both: a sustained absolute lag (actionable on its own)
+#     and a positive short-term slope (catches "growing but still low").
+#
+# Thresholds without a named source in .env.example (unswept_balance_usd,
+# manual_review_open, head_lag_blocks, active_reserved_addresses) are
+# placeholders picked to be directionally reasonable for a portfolio-scale
+# deployment, not numbers derived from production traffic that does not exist
+# yet. Tune them once real volume exists; the alert existing and firing on a
+# wrong number is a five-minute fix, the alert not existing is not.
+
+groups:
+  # -------------------------------------------------------------------------
+  # Money — TZ section 7's alert table, rows 1-6 and 10
+  # -------------------------------------------------------------------------
+  - name: notchstave-money
+    rules:
+      - alert: NotchstaveRevertedCreditsGrew
+        expr: increase(notchstave_reverted_credits_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          domain: money
+        annotations:
+          summary: "Access was revoked at least once in the last 15 minutes"
+          tz_reason: >-
+            Товар выдан за платёж, которого нет. Разбор немедленный.
+          runbook: >-
+            Check settler logs for `handle_reorg` around the same window and
+            confirm the notification correcting the buyer went out
+            (notchstave_notifications_sent_total{kind="invoice_settled"} vs the
+            revocation).
+
+      - alert: NotchstaveReconcileDriftAboveThreshold
+        # Keep in sync with ADMIN_RECONCILE_DRIFT_THRESHOLD_USD in .env.example.
+        expr: notchstave_reconcile_drift_usd > 1
+        for: 0m
+        labels:
+          severity: critical
+          domain: money
+        annotations:
+          summary: "Ledger and on-chain balance disagree by more than $1 on chain {{ $labels.chain }}"
+          tz_reason: >-
+            БД и цепь разошлись. Это баг в учёте денег, самое серьёзное, что
+            может случиться.
+          runbook: "Run `/reconcile` manually and read settler.admin.reconcile's report before touching anything."
+
+      - alert: NotchstaveUnsweptBalanceHigh
+        # Placeholder — TZ names no number. Tune once real deposit volume exists.
+        expr: notchstave_unswept_balance_usd > 500
+        for: 10m
+        labels:
+          severity: warning
+          domain: money
+        annotations:
+          summary: "More than $500 sitting unswept on chain {{ $labels.chain }} hot addresses"
+          tz_reason: "На горячих адресах скопилось слишком много. Пора свипать офлайн."
+          runbook: "Run /sweeplist, verify three addresses by independent derivation (TZ section 9 checklist), sweep offline."
+
+      - alert: NotchstaveAddressIndexGapHigh
+        expr: notchstave_address_index_gap > 20
+        for: 0m
+        labels:
+          severity: warning
+          domain: money
+        annotations:
+          summary: "Derivation index gap is above 20"
+          tz_reason: "Приближаемся к проблеме gap limit при восстановлении кошелька."
+          runbook: "Check whether reserved addresses are stuck (expired invoices not returning to the pool) before assuming organic growth."
+
+      - alert: NotchstaveHeadLagAbsolute
+        # "Растёт" needs both a level and a slope alert — see file header.
+        expr: notchstave_head_lag_blocks > 50
+        for: 5m
+        labels:
+          severity: critical
+          domain: reliability
+        annotations:
+          summary: "Watcher on chain {{ $labels.chain }} is more than 50 blocks behind head"
+          tz_reason: "Watcher отстал, платежи не видны."
+          runbook: "Check notchstave_rpc_errors_total and notchstave_rpc_breaker_state for the same chain — a stuck provider is the usual cause."
+
+      - alert: NotchstaveHeadLagGrowing
+        expr: deriv(notchstave_head_lag_blocks[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          domain: reliability
+        annotations:
+          summary: "Watcher on chain {{ $labels.chain }} is falling further behind head"
+          tz_reason: "Watcher отстал, платежи не видны — leading indicator before NotchstaveHeadLagAbsolute fires."
+          runbook: "Same as NotchstaveHeadLagAbsolute; this one exists to catch the trend before the level alert would."
+
+      - alert: NotchstaveManualReviewBacklog
+        # Placeholder — TZ names "больше N" without a number.
+        expr: notchstave_manual_review_open > 10
+        for: 15m
+        labels:
+          severity: warning
+          domain: money
+        annotations:
+          summary: "More than 10 manual review cases are open"
+          tz_reason: "Ручные разборы копятся, продукт требует внимания."
+          runbook: "Run `/pending` and work the queue; see settler.admin.reviews."
+
+      - alert: NotchstaveOrphanPaymentsGrew
+        expr: increase(notchstave_orphan_payments_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          domain: money
+        annotations:
+          summary: "A payment landed on a reused address outside its reservation window (chain {{ $labels.chain }})"
+          tz_reason: "Деньги пришли на переиспользованный адрес вне окна. Не потеря, но обязателен ручной разбор."
+          runbook: "settler.service.review_anomalous_payments opens the case automatically — check /pending."
+
+  # -------------------------------------------------------------------------
+  # Security block (TZ 5.8) — TZ section 7 puts these on a separate dashboard
+  # panel because normal is zero for almost all of them; the same separation
+  # applies here so a security alert never gets lost in a wall of money noise.
+  # -------------------------------------------------------------------------
+  - name: notchstave-security
+    rules:
+      - alert: NotchstaveAddressMismatch
+        expr: increase(notchstave_address_mismatch_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          domain: security
+        annotations:
+          summary: "An invoice address does not derive from the account xpub"
+          tz_reason: >-
+            Адрес в инвойсе не выводится из xpub. Подозрение на компрометацию
+            БД или на баг деривации — приём платежей останавливается до
+            разбора (5.8/T1).
+          status: "Wired, currently unreachable — deriver.verify / T1 checks are Week 5 scope (TZ section 11)."
+
+      - alert: NotchstaveInvoiceMacFailures
+        expr: increase(notchstave_invoice_mac_failures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          domain: security
+        annotations:
+          summary: "An invoice's integrity_mac did not verify"
+          tz_reason: "Строка инвойса изменена мимо приложения. Тот же класс, тот же порядок действий."
+          status: "Wired, currently unreachable — invoice HMAC verification is Week 5 scope (TZ section 11)."
+
+      - alert: NotchstaveActiveReservedAddressesNearCeiling
+        # Placeholder ratio — see file header. Replace 400 with the real
+        # SUM(max_active_addresses) across active hd_accounts once that is
+        # exported, or hardcode the actual configured ceiling here.
+        expr: notchstave_active_reserved_addresses > 320  # ~80% of a placeholder ceiling of 400
+        for: 5m
+        labels:
+          severity: warning
+          domain: security
+        annotations:
+          summary: "Reserved address count on chain {{ $labels.chain }} is approaching the gap-limit ceiling"
+          tz_reason: "Индексное пространство и фильтр watcher на исходе, вероятна атака на генерацию адресов (5.8/T5)."
+          status: "Approximated — compares against a fixed placeholder, not hd_accounts.max_active_addresses. See file header."
+
+      - alert: NotchstaveInvoiceRateLimitHits
+        expr: increase(notchstave_invoice_ratelimit_hits_total[5m]) > 20
+        for: 0m
+        labels:
+          severity: info
+          domain: security
+        annotations:
+          summary: "Invoice creation rate limiting is triggering repeatedly (scope {{ $labels.scope }})"
+          tz_reason: "Срабатывания квот на создание инвойса (T5) — informational unless sustained, unlike the zero-normal families above."
+          status: "Wired, currently unreachable — invoice quotas are Week 5 scope (TZ section 11)."
+
+      - alert: NotchstaveDoubleGrantBlockedFiring
+        expr: increase(notchstave_double_grant_blocked_total[15m]) > 5
+        for: 0m
+        labels:
+          severity: warning
+          domain: security
+        annotations:
+          summary: "entitlements_active_uniq has blocked more than 5 double-grant attempts in 15 minutes"
+          tz_reason: >-
+            Ненулевое значение не авария, но повод посмотреть на
+            конкурентность (T2) — this alert exists because a *rate* of races
+            is different from the occasional one the index is expected to
+            catch.
+
+  # -------------------------------------------------------------------------
+  # Supplementary — not named in the TZ section 7 table, added because they
+  # are metrics this week's instrumentation pass actually emits and losing an
+  # RPC provider or a circuit breaker tripping is exactly the kind of thing a
+  # "reliability" week (TZ section 11, week 4) should surface on its own.
+  # -------------------------------------------------------------------------
+  - name: notchstave-supplementary
+    rules:
+      - alert: NotchstaveRpcBreakerOpen
+        expr: notchstave_rpc_breaker_state == 2
+        for: 2m
+        labels:
+          severity: warning
+          domain: reliability
+        annotations:
+          summary: "Circuit breaker for {{ $labels.provider }} on chain {{ $labels.chain }} has been open for 2+ minutes"
+          runbook: "Provider is out of rotation. Check notchstave_rpc_errors_total for that provider before assuming it will recover on its own."
+
+      - alert: NotchstaveProviderDisagreement
+        expr: increase(notchstave_provider_disagreement_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          domain: reliability
+        annotations:
+          summary: "Two RPC providers returned different block hashes at the same height on chain {{ $labels.chain }}"
+          runbook: "Large payments on this chain are blocked from crediting until this clears (TZ 5.6) — not silent, but worth knowing why."
+
+      - alert: NotchstaveGetLogsFilterGrowing
+        expr: deriv(notchstave_getlogs_filter_size[30m]) > 0
+        for: 30m
+        labels:
+          severity: info
+          domain: security
+        annotations:
+          summary: "The watcher's eth_getLogs address filter on chain {{ $labels.chain }} is steadily growing"
+          tz_reason: "Прямой предвестник деградации детекции под нагрузкой (5.8/T5) — earlier warning than NotchstaveActiveReservedAddressesNearCeiling."

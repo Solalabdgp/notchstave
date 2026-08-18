@@ -27,10 +27,25 @@ want a schedule; see the TODO at the end of :mod:`settler.admin.reconcile`.
 
 Not wired here (deliberately, with owners named):
 
-* metrics HTTP endpoint — TZ section 7 puts `/metrics` and `/healthz` on the
-  api process; ``settler.metrics`` only defines the collectors.
+* `/healthz` — TZ section 7 puts it on the api process, and unlike the point
+  below there is no cross-process obstacle to that: `/healthz` is a live check
+  (DB, Redis, watcher liveness per chain, at least one RPC provider), not a
+  registry read, so one process can answer for the others by querying the same
+  things they would.
 * Redis — see :mod:`settler.locks`. ``REDIS_URL`` being unset is a supported
   production configuration, not a degraded one.
+
+**`/metrics` is wired here**, on its own port (`SETTLER_METRICS_PORT`,
+default 9103), the same pattern :mod:`watcher.main` already uses. An earlier
+version of this docstring put `/metrics` on the api process too, following TZ
+section 7's wording literally — but that cannot work as stated:
+``prometheus_client``'s default registry is per-process memory, and the api
+process is a different OS process from this one (see `docker-compose.yml`).
+Nothing incremented here would be visible to a `collect()` running there
+without ``PROMETHEUS_MULTIPROC_DIR`` wiring that does not exist in this repo.
+Serving this process's own registry on its own port is what actually gets
+these numbers into Prometheus this week; see :func:`settler.metrics
+.start_exporter` for the full reasoning.
 """
 
 from __future__ import annotations
@@ -45,6 +60,7 @@ from contextlib import suppress
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from settler import metrics
 from settler.locks import InvoiceLock, NullLock
 from settler.policy import MoneyPolicy
 from settler.service import LIVE_INVOICE_STATUSES, Settler
@@ -148,6 +164,17 @@ async def run_once(settler: Settler, engine: AsyncEngine, *, batch: int = 200) -
 async def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     interval = float(os.environ.get("SETTLER_POLL_INTERVAL_SECONDS", "5"))
+    metrics_port = int(os.environ.get("SETTLER_METRICS_PORT", "9103"))
+
+    # Not fatal if it fails (a bad port, one already bound) — same call as
+    # watcher.metrics.start_exporter, and the same reasoning: a settler running
+    # without an exporter looks identical to a healthy one from the outside,
+    # and TZ section 7 makes the dashboard part of the deliverable, so silence
+    # here would be the wrong failure mode.
+    try:
+        metrics.start_exporter(metrics_port)
+    except OSError:
+        log.exception("could not start /metrics on port %d", metrics_port)
 
     engine = build_engine()
     settler = Settler(engine, policy=MoneyPolicy.from_env(), lock=build_lock())

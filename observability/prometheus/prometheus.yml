@@ -1,0 +1,64 @@
+# Notchstave — Prometheus scrape + alerting config (TZ section 7).
+#
+# Mounted read-only into the `prometheus` service by docker-compose.yml.
+#
+# Every target below is a *process*, not a service in this compose file: TZ
+# section 4 puts one watcher per chain and a separate settler, and none of them
+# run in Docker in local dev (only Postgres/Redis do — see docker-compose.yml's
+# top comment). `host.docker.internal` is how the Prometheus container reaches
+# a process running on the host; docker-compose.yml adds the Linux
+# `host-gateway` alias so this also works unmodified on the Hetzner deploy.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []  # No Alertmanager wired yet — see the README "what's not here" note.
+
+scrape_configs:
+  # One watcher process per chain (TZ section 4). Base is week 1; Ethereum
+  # mainnet is week 4's second network, added here as a config line, per TZ
+  # section 11: "подключение второй сети — настройкой, а не переписыванием."
+  # Run a second watcher instance with WATCHER_METRICS_PORT=9202 and
+  # --chain-id 1 to make this target real; until then Prometheus marks it
+  # `down`, which is itself informative (see the README's "what's not here").
+  - job_name: notchstave-watcher-base
+    static_configs:
+      - targets: ["host.docker.internal:9102"]
+        labels:
+          chain: "8453"
+          chain_name: base
+
+  - job_name: notchstave-watcher-ethereum
+    static_configs:
+      - targets: ["host.docker.internal:9202"]
+        labels:
+          chain: "1"
+          chain_name: ethereum-mainnet
+
+  # settler/main.py starts its own exporter (settler.metrics.start_exporter) on
+  # SETTLER_METRICS_PORT, default 9103 — see that module's docstring for why
+  # this lives on its own port rather than on a shared api process.
+  - job_name: notchstave-settler
+    static_configs:
+      - targets: ["host.docker.internal:9103"]
+
+  # --- Not yet reachable ------------------------------------------------
+  # notifier/metrics.py declares its collectors (notchstave_dlq_size and
+  # friends) but notifier/main.py does not yet call start_http_server the way
+  # watcher and settler do — same gap settler had before this week's fix (see
+  # settler/metrics.py::start_exporter's docstring). Uncomment once it does;
+  # the natural default is 9104, one past the settler.
+  #
+  # - job_name: notchstave-notifier
+  #   static_configs:
+  #     - targets: ["host.docker.internal:9104"]
+  #
+  # api and bot have no metrics at all yet (both are still the Week 1
+  # scaffolding stub in api/main.py and bot/main.py) — nothing to scrape.

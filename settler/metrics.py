@@ -22,11 +22,12 @@ section 7 — "Ненулевое значение не авария, но по�
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from core import metrics as core_metrics
 
 __all__ = [
+    "start_exporter",
     "INVOICES_SETTLED",
     "REVERTED_CREDITS",
     "DOUBLE_GRANT_BLOCKED",
@@ -117,3 +118,31 @@ ADMIN_ACTIONS = Counter(
     "Owner actions on money, by action (TZ 3.4 admin commands, 5.8/T7).",
     ["action"],
 )
+
+
+def start_exporter(port: int) -> bool:
+    """Expose this process's own ``/metrics``. Same call surface as
+    :func:`watcher.metrics.start_exporter`, and the reason there are now two
+    copies rather than one shared helper is worth writing down.
+
+    TZ section 7 says ``/metrics`` lives on the api process, and
+    :mod:`settler.main`'s module docstring used to repeat that as the reason
+    nothing here was wired. That statement does not survive the process
+    boundary: settler, notifier and (eventually) api are separate OS
+    processes, and ``prometheus_client``'s default registry is per-process
+    memory — a Counter incremented in the settler's address space is not
+    visible to a `collect()` call running in api's, import or no import.
+    Making the stated design true would need every process to write to
+    ``PROMETHEUS_MULTIPROC_DIR`` and api to read it back with
+    ``multiprocess.MultiProcessCollector``, which is a real pattern but is not
+    wired anywhere in this repo, and building it is out of scope for landing
+    real metric *values* this week.
+
+    Until that lands (or is deliberately chosen against), each process serves
+    its own registry on its own port — exactly the pattern
+    ``watcher.metrics.start_exporter`` already uses in production. Wired from
+    :func:`settler.main.main`, gated on ``SETTLER_METRICS_PORT`` the same way
+    ``WATCHER_METRICS_PORT`` gates the watcher's.
+    """
+    start_http_server(port)
+    return True

@@ -22,6 +22,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.db import enums as E
+from settler import metrics
 from settler.errors import InvoiceNotFound
 from settler.policy import Outcome
 from settler.service import (
@@ -29,7 +30,14 @@ from settler.service import (
     settle_invoice,
     sweep_expired_invoices,
 )
-from settler.tests.conftest import Scenario, World, count, invoice_status, payment_status
+from settler.tests.conftest import (
+    Scenario,
+    World,
+    count,
+    invoice_status,
+    payment_status,
+    sample_value,
+)
 
 USDC = 1_000_000  # one whole token in base units, 6 decimals
 
@@ -722,6 +730,97 @@ async def test_the_grant_and_its_message_are_written_together(
     assert row["dedup_key"] == str(result.entitlement_id)
     assert row["payload_json"]["entitlement_id"] == result.entitlement_id
     assert row["subscription_expires"], "a subscription product must expire (TZ 3.3)"
+
+
+async def test_payment_credit_seconds_is_observed_on_grant(
+    conn: AsyncConnection, world: World
+) -> None:
+    """TZ section 7 — ``notchstave_payment_credit_seconds``: "от первого
+    обнаружения до выдачи доступа".
+
+    The collector existed in ``settler/metrics.py`` before this test but was
+    never ``.observe()``-d anywhere (grep the codebase pre-fix: zero hits
+    outside the declaration and ``__all__``). Backdating ``payments.created_at``
+    by a known amount and asserting the histogram's sum moved by roughly that
+    amount is what tells the two apart — asserting only that the metric object
+    exists would still pass against the dead collector.
+    """
+    s = await world.scenario(amount_due_raw=10 * USDC)
+    payment_id = await world.payment(
+        chain_id=s.chain_id,
+        asset_id=s.asset_id,
+        address_id=s.address_id,
+        invoice_id=s.invoice_id,
+        amount_raw=10 * USDC,
+        block_number=90,
+    )
+    await conn.execute(
+        sa.text(
+            "UPDATE payments SET created_at = now() - interval '90 seconds' WHERE id = :id"
+        ),
+        {"id": payment_id},
+    )
+
+    before_count = sample_value(metrics.PAYMENT_CREDIT_SECONDS, "_count")
+    before_sum = sample_value(metrics.PAYMENT_CREDIT_SECONDS, "_sum")
+
+    result = await settle_invoice(conn, s.invoice_id)
+
+    assert result.granted
+    after_count = sample_value(metrics.PAYMENT_CREDIT_SECONDS, "_count")
+    after_sum = sample_value(metrics.PAYMENT_CREDIT_SECONDS, "_sum")
+    assert after_count == before_count + 1
+    # ~90s backdate plus whatever the test itself took to reach this line.
+    assert 85 <= (after_sum - before_sum) <= 150
+
+
+async def test_payment_credit_seconds_uses_the_credited_payment_not_an_anomaly(
+    conn: AsyncConnection, world: World
+) -> None:
+    """The histogram must read detection time off the payment that actually
+    paid the bill, not off an older anomalous payment sitting on the same
+    invoice (TZ 5.5 lets an anomaly and a good payment coexist on one invoice —
+    see ``test_an_anomalous_transfer_does_not_block_a_correct_one`` above).
+    """
+    s = await world.scenario(amount_due_raw=10 * USDC)
+    old_anomalous = await world.payment(
+        chain_id=s.chain_id,
+        asset_id=s.asset_id,
+        address_id=s.address_id,
+        invoice_id=s.invoice_id,
+        amount_raw=5 * USDC,
+        block_number=80,
+        status=E.PaymentStatus.IGNORED_DUST,
+        anomaly=E.PaymentAnomaly.DUST,
+    )
+    await conn.execute(
+        sa.text(
+            "UPDATE payments SET created_at = now() - interval '1 hour' WHERE id = :id"
+        ),
+        {"id": old_anomalous},
+    )
+    good_payment = await world.payment(
+        chain_id=s.chain_id,
+        asset_id=s.asset_id,
+        address_id=s.address_id,
+        invoice_id=s.invoice_id,
+        amount_raw=10 * USDC,
+        block_number=90,
+    )
+    await conn.execute(
+        sa.text(
+            "UPDATE payments SET created_at = now() - interval '20 seconds' WHERE id = :id"
+        ),
+        {"id": good_payment},
+    )
+
+    before_sum = sample_value(metrics.PAYMENT_CREDIT_SECONDS, "_sum")
+    result = await settle_invoice(conn, s.invoice_id)
+    assert result.granted
+    observed = sample_value(metrics.PAYMENT_CREDIT_SECONDS, "_sum") - before_sum
+
+    # Would be ~3600s if the hour-old dust payment leaked into the calculation.
+    assert 15 <= observed <= 60
 
 
 async def test_every_money_decision_records_the_policy_that_made_it(
