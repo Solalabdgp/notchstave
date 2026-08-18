@@ -1,0 +1,29 @@
+# Notifier test environment.
+#
+# A deliberate subset of the root pyproject, same rule as settler/tests: the
+# notifier imports nothing from web3 / fastapi / celery, and installing them
+# would add minutes to every run for no coverage. Pins MUST match the root
+# pyproject.toml where a package appears in both.
+#
+# aiogram is absent, and that absence is the point of Week 4's design: the
+# delivery loop, the retry curve, the DLQ and the rate limiter are all tested
+# without a Telegram client existing, through the `MessageSender` protocol.
+# When Week 5 adds the aiogram sender, this file gains one line and none of
+# these tests change.
+#
+# `redis` IS here, unlike in settler/tests, because the rate limiter's Redis
+# path is real code with a Lua script in it — the one thing in this package that
+# cannot be verified by reading. The tests that use it skip themselves when
+# REDIS_URL is unset; docker-compose.test.yml sets it.
+#
+# Versions resolved against the PyPI JSON API on 2026-08-19, not from memory.
+
+sqlalchemy==2.0.52
+greenlet==3.5.5
+psycopg[binary]==3.3.4
+alembic==1.19.1
+prometheus-client==0.26.0
+redis==8.1.0
+
+pytest==9.1.1
+pytest-asyncio==1.4.0

@@ -889,6 +889,12 @@ class Notification(Base):
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sa.text("0"))
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Backoff schedule AND in-flight lease, one column doing both jobs (TZ 5.5,
+    #: migration 0004). NULL means "eligible now". The notifier stamps
+    #: ``now() + lease`` at claim time, so a crashed attempt is retried after the
+    #: lease rather than immediately, and a second instance cannot pick up a
+    #: message that may still be in flight.
+    next_attempt_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
     sent_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
     #: Telegram message id, so the bot can prove it never edits an address message.
     message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -902,6 +908,18 @@ class Notification(Base):
             "ix_notifications_queue",
             "created_at",
             postgresql_where=sa.text("status = 'queued'"),
+        ),
+        # The other half of the claim predicate: rows whose backoff has elapsed.
+        Index(
+            "ix_notifications_retry",
+            "next_attempt_at",
+            postgresql_where=sa.text("status = 'failed'"),
+        ),
+        # `notchstave_dlq_size` is read on every notifier pass (TZ 7).
+        Index(
+            "ix_notifications_dead",
+            "created_at",
+            postgresql_where=sa.text("status = 'dead'"),
         ),
         Index("ix_notifications_user_id", "user_id"),
         CheckConstraint("attempts >= 0", name="attempts_non_negative"),

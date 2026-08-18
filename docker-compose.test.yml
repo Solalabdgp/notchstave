@@ -57,16 +57,35 @@ services:
       timeout: 3s
       retries: 30
 
+  # Only the notifier suite needs this, and only for the Lua half of the rate
+  # limiter (`notifier/tests/test_redis_ratelimit.py`). Everything else in the
+  # repo treats Redis as optional and must keep working without it — see
+  # `notifier/tests/test_no_redis.py`, which runs whether this service is up or
+  # not. No volume and no password: it holds two token-bucket hashes with a
+  # sub-second TTL, and nothing in it survives a run by design.
+  redis:
+    image: redis:7-alpine
+    container_name: notchstave-test-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   tests:
     image: python:3.12-slim
     container_name: notchstave-test-runner
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       # psycopg 3 is one driver with a sync and an async face; SQLAlchemy picks
       # the async one for an async engine. Same URL for Alembic and for tests.
       DATABASE_URL: postgresql+psycopg://notchstave:testpw@postgres:5432/notchstave_test
+      REDIS_URL: redis://redis:6379/0
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:
@@ -77,9 +96,9 @@ services:
       - bash
       - -lc
       - |
-        pip install -q -r settler/tests/requirements.txt
+        pip install -q -r settler/tests/requirements.txt -r notifier/tests/requirements.txt
         alembic upgrade head
-        pytest settler/tests -v
+        pytest settler/tests notifier/tests -v
 
 volumes:
   notchstave_test_pipcache:

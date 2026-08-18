@@ -96,7 +96,12 @@ exclude = ["deriver/", "migrations/versions/"]
 # cannot reach it, and running both suites from one interpreter would undo that
 # separation. It is run separately — `pytest deriver/tests` from the deriver
 # environment.
-testpaths = ["settler/tests"]
+#
+# settler and notifier share an interpreter and a database because they share a
+# schema: the notifier's whole input is the table the settler writes, and a
+# disagreement between the two about the outbox contract should fail in one run
+# rather than in two that pass separately.
+testpaths = ["settler/tests", "notifier/tests"]
 
 # The settler suite talks to a real Postgres over an async engine, so every
 # test in it is a coroutine. `auto` keeps the marker off ~40 test functions
