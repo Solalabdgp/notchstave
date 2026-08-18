@@ -45,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 __all__ = [
     "InvoiceContext",
     "PaymentRow",
+    "SeenPaymentRow",
     "SQL_LOCK_INVOICE",
     "SQL_CAS_INVOICE_STATUS",
     "SQL_SETTLED_TOTAL",
@@ -72,6 +73,10 @@ __all__ = [
     "invoices_past_topup_window",
     "invoices_past_rate_lock",
     "unreviewed_anomalous_payments",
+    "unnotified_seen_payments",
+    "mark_payment_seen_notified",
+    "SQL_UNNOTIFIED_SEEN_PAYMENTS",
+    "SQL_MARK_PAYMENT_SEEN_NOTIFIED",
     "credit_internal_balance",
     "is_active_entitlement_conflict",
     "ENTITLEMENTS_ACTIVE_UNIQ",
@@ -151,6 +156,33 @@ class PaymentRow:
     #: histogram reads the same row the credit decision was made from rather
     #: than a second, possibly-stale query.
     created_at: dt.datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SeenPaymentRow:
+    """A payment that still owes the buyer the TZ 3.5 «увидели ваш перевод».
+
+    Carries the user and the asset alongside the payment because the notifier
+    cannot look either of them up: migration 0002 gives it no grant on
+    ``products`` and only a column-scoped one on ``users``, so everything the
+    message says has to be in ``payload_json`` when the row is written. That is
+    the privilege boundary of TZ section 4 showing up as a row shape — see the
+    head of :mod:`notifier.render`.
+    """
+
+    id: int
+    invoice_id: uuid.UUID
+    user_id: int
+    chain_id: int
+    asset_id: int
+    asset_symbol: str
+    asset_decimals: int
+    amount_raw: Decimal
+    tx_hash: str
+    log_index: int
+    block_number: int
+    status: str
+    anomaly: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -1030,6 +1062,126 @@ async def unreviewed_anomalous_payments(
         )
     ).mappings().all()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# "We can see your transfer" (TZ 3.5, first bullet)
+# ---------------------------------------------------------------------------
+
+#: Payments that have arrived, belong to somebody, and have not been announced.
+#:
+#: Four predicates, and each one is a decision rather than a filter:
+#:
+#: * ``seen_notified_at IS NULL`` — the flag added by migration 0005. It matches
+#:   the index predicate exactly, so this is an index scan over the outstanding
+#:   set rather than over the whole payment history on every poll.
+#: * ``invoice_id IS NOT NULL`` — an ``unassigned_payment`` has no invoice and
+#:   therefore no user to send to. It goes to a human through
+#:   :data:`SQL_UNREVIEWED_ANOMALOUS_PAYMENTS` instead.
+#: * ``status = ANY(:statuses)`` — the caller passes *seen, confirmed, credited*
+#:   rather than ``seen`` alone. A payment can go straight from ``seen`` to
+#:   ``credited`` inside one settler transaction when the chain is already deep
+#:   enough (a small payment on a chain with ``min_confirmations`` satisfied at
+#:   detection), and a query keyed on ``status = 'seen'`` would find nothing and
+#:   the buyer would never be told their transfer was seen. Statuses left out are
+#:   ``reverted`` (the money is gone; a reorg correction is a different message)
+#:   and ``ignored_dust`` (below the threshold, nothing to wait for).
+#: * ``anomaly IS NULL OR = ANY(:notifiable_anomalies)`` — the caller passes only
+#:   ``late``, which is creditable inside the top-up window. Saying "we see your
+#:   transfer and are waiting for it to confirm" about a ``wrong_asset`` or
+#:   ``wrong_chain`` transfer would be a promise the settler is about to break:
+#:   that money is never credited and goes to manual review.
+#:
+#: The joins are inner on purpose. ``invoices.user_id`` and the asset's
+#: ``symbol``/``decimals`` are both NOT NULL against tables with RESTRICT foreign
+#: keys, so a payment with an ``invoice_id`` always has both; an outer join would
+#: silently turn a broken foreign key into a NULL in a message body.
+SQL_UNNOTIFIED_SEEN_PAYMENTS = sa.text(
+    """
+    SELECT p.id, p.invoice_id, p.chain_id, p.asset_id, p.amount_raw, p.tx_hash,
+           p.log_index, p.block_number,
+           p.status::text  AS status,
+           p.anomaly::text AS anomaly,
+           i.user_id       AS user_id,
+           a.symbol        AS asset_symbol,
+           a.decimals      AS asset_decimals
+      FROM payments p
+      JOIN invoices i ON i.id = p.invoice_id
+      JOIN assets   a ON a.id = p.asset_id
+     WHERE p.seen_notified_at IS NULL
+       AND p.invoice_id IS NOT NULL
+       AND p.status::text = ANY(:statuses)
+       AND (p.anomaly IS NULL OR p.anomaly::text = ANY(:notifiable_anomalies))
+     ORDER BY p.id
+     LIMIT :limit
+    """
+).bindparams(
+    sa.bindparam("statuses", type_=_TEXT_ARRAY),
+    sa.bindparam("notifiable_anomalies", type_=_TEXT_ARRAY),
+)
+
+#: Claim one payment for announcement. CAS, TZ 5.8/T2.2 again.
+#:
+#: ``seen_notified_at IS NULL`` in the WHERE clause is what makes two settler
+#: workers on the same payment produce one message rather than two: the loser
+#: gets zero affected rows and exits without enqueuing anything. The row lock
+#: Postgres takes for the UPDATE is also what serialises them — the second worker
+#: blocks until the first commits and then re-evaluates the predicate against the
+#: committed value, not against the snapshot it read a moment earlier.
+#:
+#: ``now()`` and not a parameter, for the reason stated in the module docstring:
+#: the clock belongs to the database.
+SQL_MARK_PAYMENT_SEEN_NOTIFIED = sa.text(
+    """
+    UPDATE payments
+       SET seen_notified_at = now()
+     WHERE id = :payment_id
+       AND seen_notified_at IS NULL
+    """
+)
+
+
+async def unnotified_seen_payments(
+    conn: AsyncConnection,
+    *,
+    statuses: tuple[str, ...],
+    notifiable_anomalies: tuple[str, ...],
+    limit: int = 500,
+) -> list[SeenPaymentRow]:
+    rows = (
+        await conn.execute(
+            SQL_UNNOTIFIED_SEEN_PAYMENTS,
+            {
+                "statuses": list(statuses),
+                "notifiable_anomalies": list(notifiable_anomalies),
+                "limit": limit,
+            },
+        )
+    ).mappings().all()
+    return [
+        SeenPaymentRow(
+            id=int(r["id"]),
+            invoice_id=r["invoice_id"],
+            user_id=int(r["user_id"]),
+            chain_id=int(r["chain_id"]),
+            asset_id=int(r["asset_id"]),
+            asset_symbol=r["asset_symbol"],
+            asset_decimals=int(r["asset_decimals"]),
+            amount_raw=Decimal(r["amount_raw"]),
+            tx_hash=r["tx_hash"],
+            log_index=int(r["log_index"]),
+            block_number=int(r["block_number"]),
+            status=r["status"],
+            anomaly=r["anomaly"],
+        )
+        for r in rows
+    ]
+
+
+async def mark_payment_seen_notified(conn: AsyncConnection, payment_id: int) -> bool:
+    """``False`` means another worker already announced this payment."""
+    result = await conn.execute(SQL_MARK_PAYMENT_SEEN_NOTIFIED, {"payment_id": payment_id})
+    return result.rowcount == 1
 
 
 # ---------------------------------------------------------------------------

@@ -617,6 +617,13 @@ class Payment(Base):
     anomaly: Mapped[E.PaymentAnomaly | None] = mapped_column(
         _enum(E.PaymentAnomaly, "payment_anomaly"), nullable=True
     )
+    #: When the settler enqueued the `payment_seen` outbox row for this transfer
+    #: (TZ 3.5, migration 0005). NULL means "still owes a message". Written with
+    #: a compare-and-set in the same transaction as the outbox insert, so the two
+    #: cannot disagree; the flag exists so a five-second poll loop does not retry
+    #: an INSERT the dedup index would reject, not for correctness — see the head
+    #: of migration 0005.
+    seen_notified_at: Mapped[dt.datetime | None] = mapped_column(TS, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(TS, nullable=False, server_default=_now())
 
     invoice: Mapped[Invoice | None] = relationship(
@@ -652,6 +659,12 @@ class Payment(Base):
             "ix_payments_anomaly",
             "anomaly",
             postgresql_where=sa.text("anomaly IS NOT NULL"),
+        ),
+        # Payments that still owe the TZ 3.5 «увидели ваш перевод» message.
+        Index(
+            "ix_payments_seen_unnotified",
+            "id",
+            postgresql_where=sa.text("seen_notified_at IS NULL AND invoice_id IS NOT NULL"),
         ),
         CheckConstraint("amount_raw > 0", name="amount_raw_positive"),
         CheckConstraint("block_number >= 0", name="block_number_non_negative"),

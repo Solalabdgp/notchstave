@@ -20,6 +20,15 @@
 # Everything is thrown away between runs: the database has no volume, so a
 # passing run cannot depend on state left behind by a previous one.
 
+# The project name is pinned rather than inferred from the directory: Compose
+# would otherwise derive it from whatever the checkout happens to be called, so
+# two clones of this repo under different directory names would race for the
+# same fixed `container_name` values below and the second `up` would fail with a
+# name conflict. Naming it here makes `docker compose -p` unnecessary and makes
+# `docker compose -f docker-compose.test.yml down` find the right stack from any
+# working directory.
+name: notchstave-test
+
 services:
   postgres:
     image: postgres:17-alpine

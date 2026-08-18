@@ -12,11 +12,17 @@ What one pass does, in this order:
 1. **Reorgs first.** Rolling back a payment that no longer exists must happen
    before deciding anything else, or the same pass could grant access off a
    block that is already orphaned.
-2. **Settle candidates.** Invoices that are live and have money against them.
-3. **Expire stale quotes.** Unpaid invoices whose ``rate_locked_until`` has
+2. **Announce what has arrived.** TZ 3.5's «увидели ваш перевод», queued for
+   every payment that has not had one. Before settlement, not after: when a
+   payment is detected and credited on the same pass, the buyer should read "we
+   see it" and then "you have access", and the notifier drains the outbox in
+   insertion order. It is also after the reorg pass, so a payment whose block
+   was just orphaned is already ``reverted`` and is never announced at all.
+3. **Settle candidates.** Invoices that are live and have money against them.
+4. **Expire stale quotes.** Unpaid invoices whose ``rate_locked_until`` has
    passed (TZ 5.5). Touches nothing that holds money.
-4. **Sweep expired.** Top-up windows that closed since the last pass.
-5. **Anomalies.** Payments that no invoice will ever ask about — chiefly
+5. **Sweep expired.** Top-up windows that closed since the last pass.
+6. **Anomalies.** Payments that no invoice will ever ask about — chiefly
    ``unassigned_payment``, which by definition has no invoice to settle.
 
 The owner-facing commands of TZ 3.4 — `/pending`, `/resolve`, `/sweeplist`,
@@ -131,6 +137,10 @@ async def run_once(settler: Settler, engine: AsyncEngine, *, batch: int = 200) -
                 len(reorg.revoked_entitlement_ids),
                 reorg.revoked_entitlement_ids,
             )
+
+    # TZ 3.5, first bullet. Ordered ahead of settlement deliberately — see step 2
+    # of the module docstring.
+    await settler.notify_seen()
 
     async with engine.connect() as conn:
         rows = (

@@ -59,6 +59,17 @@ Redis that is down and a lock that lies, and ``test_reorg.py`` is the "реор�
 * ``TODO(week3, watcher contract)``: "finalized" is read as
   ``blocks.status = 'confirmed'`` — see :mod:`settler.confirmations` for the
   full reasoning and the cleaner alternative.
+* ``TODO(week5, invoice state machine)``: ``invoice_status.seen`` exists in the
+  enum (TZ 6) and in ``LIVE_INVOICE_STATUSES``, and nothing ever moves an
+  invoice into it. An invoice with money on it stays ``awaiting`` until it is
+  paid, underpaid or expires. Found while wiring :func:`notify_seen_payments`,
+  which is the natural place to CAS ``awaiting -> seen`` — same pass, same
+  trigger, and every consumer already treats the two as interchangeable through
+  ``LIVE_INVOICE_STATUSES``. Not done here on purpose: the announcement is a
+  message, that would be a state transition, and bundling a state transition
+  into the commit that fixes a missing notification is how a small fix acquires
+  a second reason to be reverted. Nothing reads the distinction today, so it
+  costs nothing to defer.
 * ``TODO(bot)``: TZ 5.8/T2.6 (dedup of ``callback_query.id`` so a double tap on
   "I paid" does not start two settlements) belongs to the aiogram handler in
   ``bot/``. It is not implemented here because it cannot be: the settler never
@@ -103,9 +114,11 @@ __all__ = [
     "sweep_expired_invoices",
     "expire_stale_invoices",
     "review_anomalous_payments",
+    "notify_seen_payments",
     "LIVE_INVOICE_STATUSES",
     "SETTLED_INVOICE_STATUSES",
     "CREDITABLE_PAYMENT_STATUSES",
+    "ANNOUNCEABLE_PAYMENT_STATUSES",
     "BLOCKING_ANOMALIES",
     "CREDITABLE_ANOMALIES",
 ]
@@ -123,6 +136,31 @@ SETTLED_INVOICE_STATUSES: tuple[str, ...] = (
 
 #: TZ 5.3 — the settled total sums payments in exactly these statuses.
 CREDITABLE_PAYMENT_STATUSES: tuple[str, ...] = tuple(E.CREDITABLE_PAYMENT_STATUSES)
+
+#: Statuses in which a payment is real money that has arrived and not gone away
+#: again — the set that earns the buyer the TZ 3.5 «увидели ваш перевод».
+#:
+#: Deliberately wider than ``seen``. The obvious reading of TZ 3.5 ("сразу после
+#: появления транзакции в блоке, до подтверждений") is that this is the ``seen``
+#: state and nothing else, and that reading has a hole: :func:`settle_invoice`
+#: promotes ``seen -> confirmed -> credited`` inside a single transaction when the
+#: payment landed deep enough to be creditable on sight, which is the normal case
+#: for a small payment on a fast chain. A payment that took that path has never
+#: been observable as ``seen`` by anything outside that transaction, and keying
+#: the announcement on ``seen`` would drop the message for exactly the buyers
+#: whose payment went best. What the TZ actually asks for is that the buyer hears
+#: *before the confirmation wait* — which is a statement about ordering, not
+#: about a status — so the query asks "has this payment been announced" and lets
+#: the flag, not the status, answer it.
+#:
+#: ``reverted`` and ``ignored_dust`` are the two left out, and for opposite
+#: reasons: the first is money that stopped existing (TZ 5.4 sends a correction,
+#: not an announcement), the second is below the dust threshold and has nothing
+#: to confirm.
+ANNOUNCEABLE_PAYMENT_STATUSES: tuple[str, ...] = (
+    str(E.PaymentStatus.SEEN),
+    *CREDITABLE_PAYMENT_STATUSES,
+)
 
 #: Statuses a reorg can pull the rug from under.
 REVERTIBLE_PAYMENT_STATUSES: tuple[str, ...] = (
@@ -1113,6 +1151,101 @@ async def expire_stale_invoices(
     return tuple(expired)
 
 
+async def notify_seen_payments(
+    conn: AsyncConnection,
+    *,
+    policy: MoneyPolicy = DEFAULT_POLICY,
+    limit: int = 500,
+) -> tuple[int, ...]:
+    """TZ 3.5 — «увидели ваш перевод», before the confirmation wait.
+
+    The first message a buyer gets after sending money, and until migration 0005
+    it did not exist: :mod:`notifier.render` has carried a ``payment_seen``
+    renderer since Week 4 and no process ever wrote a row for it. The buyer's
+    experience was a silence lasting as long as the confirmation policy of
+    TZ 5.4 demands — minutes on Ethereum above the finality threshold — with
+    their money already gone from their wallet. That is the exact window in
+    which a payment system loses somebody's trust.
+
+    **Why here and not in the watcher.** The watcher is the process that sees the
+    transfer first and would be the natural author, but migration 0002 gives
+    ``notchstave_watcher`` no privilege on ``notifications`` at all, and that is
+    a boundary worth keeping rather than a gap worth patching: the watcher is the
+    process holding connections to third-party RPC nodes, and INSERT on the
+    outbox is the ability to send arbitrary text to every user of the bot. The
+    settler already owns this pattern and already holds the two grants this
+    function needs.
+
+    **Why not inside :func:`settle_invoice`.** Two reasons, and the second is the
+    load-bearing one. A payment with no invoice-level decision pending — arrived,
+    not yet deep enough, nothing to classify — would never reach the settlement
+    path, which is precisely the payment most in need of "we can see it". And
+    :func:`settle_invoice` is called under ``SELECT ... FOR UPDATE`` on the
+    invoice; announcing from inside it would put a message the buyer is waiting
+    on behind whatever lock contention the money decision is experiencing. This
+    is a sweep over database state like the three above it, and it runs *before*
+    settlement in :func:`settler.main.run_once` so that when both happen on the
+    same pass the two rows enter the outbox in the order the buyer should read
+    them.
+
+    **Exactly-once, without leaning on the constraint.** Each payment is claimed
+    with a compare-and-set on ``seen_notified_at`` and the outbox row is written
+    in the same transaction, so the two cannot disagree in either direction: a
+    rollback takes both, and a worker that loses the CAS writes nothing.
+    ``UNIQUE (kind, ref_id, dedup_key)`` still stands behind it — belt and braces
+    — but it is no longer what the poll loop relies on, which is the whole point
+    of the column (see the head of migration 0005).
+
+    No audit row. ``audit_log`` records money decisions and owner actions
+    (TZ 5.8/T8); this function decides nothing about money and moves no state a
+    reviewer would later have to justify. The outbox row *is* the record, and it
+    is timestamped.
+    """
+    rows = await repo.unnotified_seen_payments(
+        conn,
+        statuses=ANNOUNCEABLE_PAYMENT_STATUSES,
+        # `late` only. A `wrong_asset` or `wrong_chain` transfer is never
+        # credited (TZ 5.5), so "we see your transfer and are waiting for it to
+        # confirm" would be a promise the settler is about to break; those
+        # payments go to a human through `review_anomalous_payments` instead.
+        notifiable_anomalies=CREDITABLE_ANOMALIES,
+        limit=limit,
+    )
+
+    notified: list[int] = []
+    for row in rows:
+        if not await repo.mark_payment_seen_notified(conn, row.id):
+            # Another worker claimed this payment between the SELECT and here.
+            # TZ 5.8/T2.2: zero affected rows means somebody else owns it now.
+            continue
+        notification_id = await repo.enqueue_notification(
+            conn,
+            user_id=row.user_id,
+            kind="payment_seen",
+            ref_id=str(row.invoice_id),
+            # Per payment, not per invoice: TZ 5.3 expects a buyer to be able to
+            # pay in two transfers, and each transfer is its own "we see it".
+            # Keying on the invoice would silence every message after the first.
+            dedup_key=str(row.id),
+            payload={
+                "invoice_id": str(row.invoice_id),
+                "payment_id": row.id,
+                "chain_id": row.chain_id,
+                "asset": row.asset_symbol,
+                "decimals": row.asset_decimals,
+                "amount_raw": str(row.amount_raw),
+                "tx_hash": row.tx_hash,
+                "log_index": row.log_index,
+                "block_number": row.block_number,
+                "payment_status": row.status,
+                "policy_version": policy.version,
+            },
+        )
+        if notification_id is not None:
+            notified.append(notification_id)
+    return tuple(notified)
+
+
 async def review_anomalous_payments(
     conn: AsyncConnection,
     *,
@@ -1213,6 +1346,10 @@ class Settler:
             return await expire_stale_invoices(
                 conn, policy=self._policy, actor_id=self._actor_id
             )
+
+    async def notify_seen(self) -> tuple[int, ...]:
+        async with self._engine.begin() as conn:
+            return await notify_seen_payments(conn, policy=self._policy)
 
     async def review_anomalies(self) -> tuple[int, ...]:
         async with self._engine.begin() as conn:
