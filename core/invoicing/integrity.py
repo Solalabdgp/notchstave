@@ -68,6 +68,7 @@ __all__ = [
     "IntegrityKey",
     "CREDENTIAL_NAME",
     "DOMAIN_TAG",
+    "framed",
     "canonical_payload",
     "compute_mac",
     "verify_mac",
@@ -174,13 +175,26 @@ def load_integrity_key(
     )
 
 
-def _framed(*fields: bytes) -> bytes:
-    """Length-prefix each field so no two tuples share an encoding."""
-    out = bytearray(DOMAIN_TAG)
+def framed(tag: bytes, *fields: bytes) -> bytes:
+    """Length-prefix each field under a domain tag so no two tuples collide.
+
+    Public because :mod:`core.invoicing.proof` MACs a *different* tuple with the
+    *same* key, and doing that safely is entirely a question of the tag. Two
+    claims signed under one key and one encoding scheme are only distinguishable
+    if the scheme separates them, and the cheapest way to guarantee that every
+    future claim gets its own separation is to have exactly one framing function
+    that cannot be called without naming a tag.
+    """
+    out = bytearray(tag)
     for field in fields:
         out += len(field).to_bytes(4, "big")
         out += field
     return bytes(out)
+
+
+def _framed(*fields: bytes) -> bytes:
+    """The invoice tuple's framing. Kept for the call site below to read plainly."""
+    return framed(DOMAIN_TAG, *fields)
 
 
 def _amount_bytes(amount_due_raw: Decimal | int) -> bytes:

@@ -1,0 +1,30 @@
+# Bot test environment.
+#
+# Same rule as settler/tests and notifier/tests: a deliberate subset of the root
+# pyproject, and every pin that appears in both files MUST match.
+#
+# aiogram IS here and is the point of the difference from notifier/tests. The
+# suite drives the real `Dispatcher`, the real filters and the real handlers
+# through a `Bot` whose session is replaced (see conftest.RecordingSession), so
+# what is under test is the wiring aiogram actually performs — command parsing,
+# router priority, dependency injection — and not a hand-rolled imitation of it.
+# A test that called `cmd_buy(...)` directly would pass with `Command("buy")`
+# spelled wrong.
+#
+# web3 is deliberately absent. `settler.admin.balances` imports `RpcPool` only
+# under TYPE_CHECKING and `bot.main.build_balance_source` imports the watcher
+# inside the function body, so the admin commands are testable — through the
+# `BalanceSource` protocol — without a chain client installed. TZ section 8:
+# "никаких сетевых вызовов в CI", enforced here by the dependency not existing.
+#
+# Versions resolved against the PyPI JSON API on 2026-08-19, not from memory.
+
+aiogram==3.30.0
+sqlalchemy==2.0.52
+greenlet==3.5.5
+psycopg[binary]==3.3.4
+alembic==1.19.1
+prometheus-client==0.26.0
+
+pytest==9.1.1
+pytest-asyncio==1.4.0

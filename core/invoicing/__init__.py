@@ -102,9 +102,11 @@ from core.invoicing.integrity import (
 from core.invoicing.quotas import NullQuotaCache, QuotaCache, RedisQuotaCache
 from core.invoicing.rates import PeggedRates, RateSource, StaticRates, price_to_raw
 from core.invoicing.service import (
+    MAC_ONLY,
     AddressDeriver,
     AddressPool,
     InvoiceView,
+    MacOnly,
     create_invoice,
     load_invoice_by_public_token,
     verify_invoice_address,
@@ -119,6 +121,8 @@ __all__ = [
     # seams
     "AddressDeriver",
     "AddressPool",
+    "MacOnly",
+    "MAC_ONLY",
     "RateSource",
     "QuotaCache",
     # configuration

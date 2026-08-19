@@ -120,7 +120,13 @@ follow_imports = "skip"
 # a settler run against a database where that migration had not been applied
 # would be testing a different schema from the one production gets. One run, one
 # `alembic upgrade head`, one answer.
-testpaths = ["settler/tests", "notifier/tests", "core/invoicing/tests"]
+#
+# bot/tests joins the same run in Week 5 and pulls the sharpest edge of all: its
+# conftest imports `settler.tests.conftest`'s object-graph builders rather than
+# keeping a second copy of them. Notchstave's schema is constrained enough that
+# "just insert an invoice" is fifteen statements, and two copies of those would
+# drift from the migrations independently. One run keeps the import honest.
+testpaths = ["settler/tests", "notifier/tests", "core/invoicing/tests", "bot/tests"]
 
 # The settler suite talks to a real Postgres over an async engine, so every
 # test in it is a coroutine. `auto` keeps the marker off ~40 test functions

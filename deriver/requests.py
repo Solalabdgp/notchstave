@@ -80,6 +80,23 @@ __all__ = [
     "requeue",
     "reclaim_stale",
     "prune_completed",
+    "drain",
+    "CHANNEL_PROOFS",
+    "PROOF_REPLY_PREFIX",
+    "proof_reply_channel",
+    "ProofRequest",
+    "ProvenAddress",
+    "RefusedProof",
+    "ProofOutcome",
+    "ProofIssuer",
+    "listen_for_proofs",
+    "claim_next_proof",
+    "complete_proof",
+    "refuse_proof",
+    "requeue_proof",
+    "reclaim_stale_proofs",
+    "prune_completed_proofs",
+    "drain_proofs",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_RETENTION_SECONDS",
@@ -98,6 +115,14 @@ log = logging.getLogger("notchstave.deriver.requests")
 CHANNEL_REQUESTS = "notchstave_invoice_requests"
 REPLY_CHANNEL_PREFIX = "nsr_"
 
+#: The second queue, added in migration 0008: ``/verify`` asking for a
+#: derivation proof. Separate channels rather than a discriminator on the first
+#: pair, because a listener that has to wake up for the other queue's traffic and
+#: then discover it has nothing to do is a listener that scales with somebody
+#: else's load.
+CHANNEL_PROOFS = "notchstave_proof_requests"
+PROOF_REPLY_PREFIX = "nsp_"
+
 
 def reply_channel(request_id: uuid.UUID) -> str:
     """The channel migration 0007's trigger notifies when this request finishes.
@@ -109,6 +134,11 @@ def reply_channel(request_id: uuid.UUID) -> str:
     client to read a row it cannot see yet.
     """
     return f"{REPLY_CHANNEL_PREFIX}{request_id.hex}"
+
+
+def proof_reply_channel(request_id: uuid.UUID) -> str:
+    """The channel migration 0008's trigger notifies when a proof finishes."""
+    return f"{PROOF_REPLY_PREFIX}{request_id.hex}"
 
 
 #: Claims before a request is declared poison. Three, not one: the realistic
@@ -528,6 +558,307 @@ def drain(conn: psycopg.Connection[Any]) -> Iterator[InvoiceRequest]:
     attempted: list[uuid.UUID] = []
     while True:
         request = claim_next(conn, exclude=attempted)
+        if request is None:
+            conn.rollback()
+            return
+        conn.commit()
+        attempted.append(request.request_id)
+        yield request
+
+
+# ---------------------------------------------------------------------------
+# The derivation-proof queue (migration 0008)
+# ---------------------------------------------------------------------------
+#
+# Everything below is the same machine as above against a second table, and the
+# duplication is deliberate rather than un-refactored. A generic version would
+# have to take the table name as a parameter and interpolate it into every
+# statement — string-built SQL in the one package whose entire remit is to be
+# boring about the database — and it would buy nothing, because the two queues
+# do not share a row shape, a foreign key set, or a failure vocabulary. Two
+# short, literal statement sets are cheaper to read and impossible to point at
+# the wrong table.
+#
+# What they *do* share is the lease, the attempt budget and the retention
+# window: those are constants above and are not restated here, so tuning one
+# tunes both, which is correct — they are properties of this process, not of a
+# particular question.
+
+
+@dataclass(frozen=True, slots=True)
+class ProofRequest:
+    """One claimed row of ``derivation_proof_requests``.
+
+    ``user_id`` is not decoration and not redundant with ``invoice_id``: the
+    issuer passes it into the ownership filter of TZ 5.8/T1.7, so a proof for
+    somebody else's invoice is refused *here*, in the process that can actually
+    see both, rather than being left to the bot to remember.
+    """
+
+    request_id: uuid.UUID
+    user_id: int
+    invoice_id: uuid.UUID
+    attempts: int
+    requested_at: dt.datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ProvenAddress:
+    """The issuer verified the invoice and derived its proof.
+
+    ``result_json`` is opaque here for the reason :class:`IssuedInvoice` gives:
+    JSON is off this package's stdlib allow-list precisely so that the shape of
+    an answer cannot start leaking into the package whose only job is keys.
+    """
+
+    result_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class RefusedProof:
+    """A final answer that is not a proof.
+
+    Unlike :class:`RefusedInvoice` this carries no ``error_detail``, and the
+    omission is on purpose. Every refusal reachable here is either "no such
+    invoice, or not yours" or an integrity failure; the first must leak nothing
+    at all (a detail field is how "not yours" becomes distinguishable from "no
+    such id", which is the enumeration signal T1.7 exists to withhold) and the
+    second belongs in an alert, not in a Telegram message.
+    """
+
+    error_code: str
+    error_message: str
+
+
+ProofOutcome = ProvenAddress | RefusedProof
+
+
+class ProofIssuer(Protocol):
+    """The second port :mod:`core.invoicing.issuer` plugs into this loop.
+
+    Same contract as :class:`InvoiceIssuer` with one clause relaxed: a proof
+    writes nothing, so "runs inside ``conn``'s transaction and commits nothing"
+    is satisfied trivially and the rollback on the refusal path costs nothing.
+    The clause that remains load-bearing is the last one — a *business* refusal
+    is returned, anything unexpected is raised — because that is still the only
+    signal the queue has for deciding whether a retry could ever help.
+    """
+
+    def __call__(
+        self,
+        conn: psycopg.Connection[Any],
+        deriver: AddressDeriver,
+        request: ProofRequest,
+    ) -> ProofOutcome: ...
+
+
+SQL_CLAIM_NEXT_PROOF = """
+UPDATE derivation_proof_requests AS r
+   SET status = 'processing',
+       attempts = r.attempts + 1,
+       claimed_at = now()
+ WHERE r.id = (
+           SELECT inner_r.id
+             FROM derivation_proof_requests AS inner_r
+            WHERE inner_r.status = 'pending'
+              AND NOT (inner_r.id = ANY(%(exclude)s::uuid[]))
+            ORDER BY inner_r.requested_at
+              FOR UPDATE SKIP LOCKED
+            LIMIT 1
+       )
+RETURNING r.id, r.user_id, r.invoice_id, r.attempts, r.requested_at
+"""
+
+SQL_COMPLETE_PROOF = """
+UPDATE derivation_proof_requests
+   SET status = 'done',
+       result_json = %(result_json)s::jsonb,
+       completed_at = now()
+ WHERE id = %(request_id)s
+   AND status = 'processing'
+RETURNING id
+"""
+
+SQL_REFUSE_PROOF = """
+UPDATE derivation_proof_requests
+   SET status = 'failed',
+       error_code = %(error_code)s,
+       error_message = %(error_message)s,
+       completed_at = now()
+ WHERE id = %(request_id)s
+   AND status = 'processing'
+RETURNING id
+"""
+
+SQL_REQUEUE_PROOF = """
+UPDATE derivation_proof_requests
+   SET status = 'pending',
+       claimed_at = NULL
+ WHERE id = %(request_id)s
+   AND status = 'processing'
+   AND attempts < %(max_attempts)s
+RETURNING id, attempts
+"""
+
+SQL_RECLAIM_STALE_PROOFS = """
+UPDATE derivation_proof_requests
+   SET status = 'pending',
+       claimed_at = NULL
+ WHERE status = 'processing'
+   AND claimed_at < now() - make_interval(secs => %(lease_seconds)s)
+   AND attempts < %(max_attempts)s
+RETURNING id
+"""
+
+SQL_ABANDON_STALE_PROOFS = """
+UPDATE derivation_proof_requests
+   SET status = 'failed',
+       error_code = %(error_code)s,
+       error_message = %(error_message)s,
+       completed_at = now()
+ WHERE status = 'processing'
+   AND claimed_at < now() - make_interval(secs => %(lease_seconds)s)
+   AND attempts >= %(max_attempts)s
+RETURNING id
+"""
+
+SQL_PRUNE_PROOFS = """
+DELETE FROM derivation_proof_requests
+ WHERE status IN ('done', 'failed')
+   AND completed_at < now() - make_interval(secs => %(retention_seconds)s)
+"""
+
+#: The transport's own refusal for a proof that ran out of attempts. A distinct
+#: class name from ``ABANDONED_ERROR_CODE`` because the advice differs: nothing
+#: was being created here, so "please try again" is the whole of it, and telling
+#: a buyer that "nothing was charged" about a read-only question would read as
+#: though something might have been.
+PROOF_ABANDONED_ERROR_CODE = "ProofUnavailable"
+PROOF_ABANDONED_USER_MESSAGE = (
+    "We could not build the derivation proof for this invoice right now. "
+    "Please try again in a moment."
+)
+
+
+def listen_for_proofs(conn: psycopg.Connection[Any]) -> None:
+    """Subscribe this connection to the proof channel. Autocommit, as above."""
+    if not conn.autocommit:
+        raise ValueError(
+            "the listening connection must be autocommit; notifications are not "
+            "delivered while a transaction is open"
+        )
+    conn.execute(f"LISTEN {CHANNEL_PROOFS}")
+
+
+def claim_next_proof(
+    conn: psycopg.Connection[Any], *, exclude: Sequence[uuid.UUID] = ()
+) -> ProofRequest | None:
+    """Take the oldest pending proof request, marking it ``processing``."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(SQL_CLAIM_NEXT_PROOF, {"exclude": list(exclude)})
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return ProofRequest(
+        request_id=row["id"],
+        user_id=int(row["user_id"]),
+        invoice_id=row["invoice_id"],
+        attempts=int(row["attempts"]),
+        requested_at=row["requested_at"],
+    )
+
+
+def complete_proof(
+    conn: psycopg.Connection[Any], request_id: uuid.UUID, proven: ProvenAddress
+) -> bool:
+    """Write the proof. ``False`` means the lease moved on and this pass lost it."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            SQL_COMPLETE_PROOF,
+            {"request_id": request_id, "result_json": proven.result_json},
+        )
+        return cur.fetchone() is not None
+
+
+def refuse_proof(
+    conn: psycopg.Connection[Any], request_id: uuid.UUID, refusal: RefusedProof
+) -> bool:
+    """Record a final non-answer."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            SQL_REFUSE_PROOF,
+            {
+                "request_id": request_id,
+                "error_code": refusal.error_code,
+                "error_message": refusal.error_message,
+            },
+        )
+        return cur.fetchone() is not None
+
+
+def requeue_proof(
+    conn: psycopg.Connection[Any],
+    request_id: uuid.UUID,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> bool:
+    """Put an unexpectedly failed proof request back. ``False`` when out of budget."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            SQL_REQUEUE_PROOF, {"request_id": request_id, "max_attempts": max_attempts}
+        )
+        return cur.fetchone() is not None
+
+
+def reclaim_stale_proofs(
+    conn: psycopg.Connection[Any],
+    *,
+    lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> tuple[int, int]:
+    """Lease sweep for the proof queue. Returns ``(requeued, abandoned)``."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            SQL_RECLAIM_STALE_PROOFS,
+            {"lease_seconds": lease_seconds, "max_attempts": max_attempts},
+        )
+        requeued = len(cur.fetchall())
+        cur.execute(
+            SQL_ABANDON_STALE_PROOFS,
+            {
+                "lease_seconds": lease_seconds,
+                "max_attempts": max_attempts,
+                "error_code": PROOF_ABANDONED_ERROR_CODE,
+                "error_message": PROOF_ABANDONED_USER_MESSAGE,
+            },
+        )
+        abandoned = len(cur.fetchall())
+    if requeued or abandoned:
+        log.warning(
+            "reclaimed %d stale proof request(s), abandoned %d past %d attempt(s)",
+            requeued,
+            abandoned,
+            max_attempts,
+        )
+    return requeued, abandoned
+
+
+def prune_completed_proofs(
+    conn: psycopg.Connection[Any],
+    *,
+    retention_seconds: float = DEFAULT_RETENTION_SECONDS,
+) -> int:
+    """Delete finished proof rows past their retention. Returns how many."""
+    with conn.cursor() as cur:
+        cur.execute(SQL_PRUNE_PROOFS, {"retention_seconds": retention_seconds})
+        return cur.rowcount
+
+
+def drain_proofs(conn: psycopg.Connection[Any]) -> Iterator[ProofRequest]:
+    """Yield claimed proof requests until the queue is empty."""
+    attempted: list[uuid.UUID] = []
+    while True:
+        request = claim_next_proof(conn, exclude=attempted)
         if request is None:
             conn.rollback()
             return

@@ -1,14 +1,16 @@
-"""The Telegram boundary, as a protocol — and why there is no aiogram here yet.
+"""The Telegram boundary, as a protocol — and why aiogram is not in this file.
 
-**Week 5 owns the real client.** TZ section 11 puts "тексты сообщений" in Week
-5, and the bot process that owns the aiogram ``Bot`` session does not exist
-beyond a stub. Week 4 owns "надёжность: backoff, DLQ, метрики" — the retry
-curve, the DLQ, the rate limiter and the outbox drain, all of which are
-properties of *this* package and none of which need a live Telegram token to be
-correct or to be tested. So the boundary is a
-:class:`~typing.Protocol` with two implementations that are honest about what
-they are, and the aiogram adapter arrives in Week 5 as a third one, without a
-line of the delivery logic changing.
+**Week 4 built the delivery loop against this protocol, before a Telegram client
+existed.** The retry curve, the DLQ, the rate limiter and the outbox drain are
+properties of *this* package and none of them need a live token to be correct or
+to be tested. Week 5 added the real adapter, :class:`notifier.telegram
+.AiogramSender`, and not one line of the delivery logic changed to accept it —
+which is the claim this protocol was written to make good on.
+
+It stays in its own module rather than joining the two doubles below, so that
+importing the protocol never requires aiogram. ``notifier/tests/
+requirements.txt`` deliberately installs no Telegram client, and the whole
+delivery suite runs against the doubles here.
 
 The protocol is deliberately narrower than aiogram's API: one method, taking a
 value object, returning a message id. Everything the notifier needs from
@@ -73,8 +75,11 @@ class MessageSender(Protocol):
     retry policy is downstream of it — and it belongs next to the transport,
     which is the only place that knows what a given status code means.
 
-    TODO(Week 5): ``AiogramSender``, wrapping ``bot.send_message`` /
-    ``bot.edit_message_text``. The mapping it owes this protocol:
+    The real one is :class:`notifier.telegram.AiogramSender` (Week 5), in its
+    own module so that this protocol stays importable without a Telegram client
+    installed — which is what lets the whole delivery suite run without one. The
+    mapping it owes this protocol, restated here because it is a property of the
+    *contract* rather than of that implementation:
       * ``TelegramForbiddenError``            -> ``BotBlockedError``
       * ``TelegramRetryAfter``                -> ``RateLimitedError(retry_after)``
       * ``TelegramBadRequest`` ("message is not modified") -> success, no-op

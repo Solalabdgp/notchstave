@@ -28,9 +28,6 @@ Not wired here, with owners named:
 
 * ``/metrics`` — TZ section 7 puts the endpoint on the api process. This
   package declares the collectors (:mod:`notifier.metrics`) and nothing else.
-* the real Telegram client — Week 5 (see :mod:`notifier.sender`). Until it
-  lands this process refuses to start unless ``NOTIFIER_DRY_RUN=1`` says the
-  operator knows the messages are only being logged.
 """
 
 from __future__ import annotations
@@ -102,27 +99,43 @@ def build_rate_limiter(config: NotifierConfig) -> RateLimiter:
 
 
 def build_sender() -> MessageSender:
-    """Refuse to run without a real transport, unless told to explicitly.
+    """The real Telegram transport, or the dry run if explicitly asked for.
 
-    The failure mode this guards against is specific and quiet: a sender that
-    always succeeds without sending marks every outbox row ``sent``, and the
-    outbox is the one structure whose entire value is that an undelivered
+    The dry run stays selectable and stays *not the default*, because a sender
+    that always succeeds without sending marks every outbox row ``sent`` — and
+    the outbox is the one structure whose entire value is that an undelivered
     message about somebody's money is still there tomorrow. Defaulting to a
     no-op would drain the queue into nothing on the first accidental start
     against a production database.
 
-    TODO(Week 5): return ``AiogramSender(Bot(token=...))`` when the bot process
-    owns a session; the token belongs in a systemd credential, never in the
-    environment (TZ section 9).
+    The order is dry-run first, then the token, so that ``NOTIFIER_DRY_RUN=1``
+    works on a machine with no credential installed. A missing token with the
+    flag unset is a startup failure rather than a silent downgrade: the two
+    states this function must never confuse are "delivering" and "pretending
+    to".
+
+    **The bot and the notifier hold separate sessions of the same token, on
+    purpose.** They are separate systemd units (TZ section 4) and a shared
+    ``Bot`` object would mean a shared process. Telegram's limits are per bot,
+    not per connection, and that is what :mod:`notifier.ratelimit` is for —
+    with Redis configured the two processes share one budget, which is the
+    arrangement TZ 5.5 describes.
     """
     if os.environ.get("NOTIFIER_DRY_RUN") == "1":
         log.warning("NOTIFIER_DRY_RUN=1: messages are logged, not sent, and marked delivered")
         return DryRunSender()
-    raise RuntimeError(
-        "no Telegram transport: the aiogram sender lands in Week 5. Set "
-        "NOTIFIER_DRY_RUN=1 to run the delivery loop against a database with "
-        "messages logged instead of sent."
-    )
+
+    # Imported here, not at module scope: `notifier.sender` defines the protocol
+    # and the tests exercise the whole delivery loop through it without a
+    # Telegram client installed at all (notifier/tests/requirements.txt). A
+    # top-level import would make that impossible, the same way it would for the
+    # optional Redis client above.
+    from aiogram import Bot
+
+    from core.telegram import load_bot_token
+    from notifier.telegram import AiogramSender
+
+    return AiogramSender(Bot(token=load_bot_token()))
 
 
 async def run_forever(notifier: Notifier, *, stopping: asyncio.Event) -> None:

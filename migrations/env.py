@@ -37,7 +37,19 @@ from core.db.base import Base  # noqa: E402
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers=False`, and it is not a preference.
+    #
+    # `fileConfig` defaults to True, which sets `disabled = True` on every
+    # logger that already exists in the interpreter — permanently, and without
+    # a word. From a `alembic upgrade head` shell that costs nothing, because
+    # nothing else has logged yet. In a *process* that runs the migrations
+    # in-band it silences the application: the test suites call
+    # `command.upgrade` from a session fixture, and every `notchstave.*` logger
+    # created before that call goes mute for the rest of the run — which is how
+    # a test asserting that an address-substitution alert was logged at
+    # `critical` (TZ 5.8/T1.1) passes on its own and fails in the full suite,
+    # having proved nothing either time.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

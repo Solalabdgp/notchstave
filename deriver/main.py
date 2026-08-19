@@ -54,16 +54,28 @@ from deriver.requests import (
     DEFAULT_LEASE_SECONDS,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_RETENTION_SECONDS,
+    PROOF_ABANDONED_ERROR_CODE,
+    PROOF_ABANDONED_USER_MESSAGE,
     InvoiceIssuer,
     InvoiceRequest,
+    ProofIssuer,
+    ProofRequest,
     RefusedInvoice,
+    RefusedProof,
     complete,
+    complete_proof,
     drain,
+    drain_proofs,
+    listen_for_proofs,
     listen_for_requests,
     prune_completed,
+    prune_completed_proofs,
     reclaim_stale,
+    reclaim_stale_proofs,
     refuse,
+    refuse_proof,
     requeue,
+    requeue_proof,
     wait_for_request,
 )
 
@@ -74,8 +86,11 @@ __all__ = [
     "build_deriver",
     "serve",
     "serve_one",
+    "serve_one_proof",
     "run_once",
+    "run_once_proofs",
     "housekeeping",
+    "housekeeping_proofs",
     "database_dsn",
     "main",
     "DEFAULT_POLL_INTERVAL_SECONDS",
@@ -216,6 +231,65 @@ def serve_one(
     return "issued"
 
 
+def serve_one_proof(
+    conn: psycopg.Connection[Any],
+    deriver: AddressDeriver,
+    issuer: ProofIssuer,
+    request: ProofRequest,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> str:
+    """Run the proof issuer for one claimed request and record the outcome.
+
+    Returns ``proven`` / ``refused`` / ``retry`` / ``abandoned`` / ``lease_lost``.
+
+    Structurally identical to :func:`serve_one`, with one difference worth
+    naming rather than leaving to be inferred: the ``lease_lost`` branch here
+    throws away nothing. A proof is a read, so losing the race to another pass
+    costs a recomputation and not an invoice — but it is still rolled back and
+    still logged, because a lease that expires under a read means the read took
+    thirty seconds, and that is worth seeing in a log either way.
+    """
+    try:
+        outcome = issuer(conn, deriver, request)
+    except Exception:
+        conn.rollback()
+        logger.exception(
+            "proof request %s failed on attempt %d", request.request_id, request.attempts
+        )
+        if requeue_proof(conn, request.request_id, max_attempts=max_attempts):
+            conn.commit()
+            return "retry"
+        refuse_proof(
+            conn,
+            request.request_id,
+            RefusedProof(
+                error_code=PROOF_ABANDONED_ERROR_CODE,
+                error_message=PROOF_ABANDONED_USER_MESSAGE,
+            ),
+        )
+        conn.commit()
+        return "abandoned"
+
+    if isinstance(outcome, RefusedProof):
+        conn.rollback()
+        refuse_proof(conn, request.request_id, outcome)
+        conn.commit()
+        logger.info(
+            "proof request %s refused: %s", request.request_id, outcome.error_code
+        )
+        return "refused"
+
+    if not complete_proof(conn, request.request_id, outcome):
+        conn.rollback()
+        logger.error("proof request %s: lease lost mid-proof, rolled back", request.request_id)
+        return "lease_lost"
+
+    conn.commit()
+    logger.info("proof request %s -> invoice %s proven", request.request_id, request.invoice_id)
+    return "proven"
+
+
 def run_once(
     conn: psycopg.Connection[Any],
     deriver: AddressDeriver,
@@ -232,6 +306,20 @@ def run_once(
     return [
         serve_one(conn, deriver, issuer, request, max_attempts=max_attempts)
         for request in drain(conn)
+    ]
+
+
+def run_once_proofs(
+    conn: psycopg.Connection[Any],
+    deriver: AddressDeriver,
+    issuer: ProofIssuer,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> list[str]:
+    """Drain the proof queue. Returns one outcome label per request served."""
+    return [
+        serve_one_proof(conn, deriver, issuer, request, max_attempts=max_attempts)
+        for request in drain_proofs(conn)
     ]
 
 
@@ -252,6 +340,28 @@ def housekeeping(
         conn, lease_seconds=lease_seconds, max_attempts=max_attempts
     )
     pruned = prune_completed(conn, retention_seconds=retention_seconds)
+    conn.commit()
+    return requeued, abandoned, pruned
+
+
+def housekeeping_proofs(
+    conn: psycopg.Connection[Any],
+    *,
+    lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retention_seconds: float = DEFAULT_RETENTION_SECONDS,
+) -> tuple[int, int, int]:
+    """The same sweep for the proof queue (migration 0008).
+
+    A separate function rather than a flag on :func:`housekeeping`, because
+    :func:`serve` runs the proof half only when it was given a proof issuer —
+    sweeping a queue nobody is serving would answer requests with "abandoned"
+    that a correctly configured deployment is about to answer properly.
+    """
+    requeued, abandoned = reclaim_stale_proofs(
+        conn, lease_seconds=lease_seconds, max_attempts=max_attempts
+    )
+    pruned = prune_completed_proofs(conn, retention_seconds=retention_seconds)
     conn.commit()
     return requeued, abandoned, pruned
 
@@ -293,6 +403,7 @@ def serve(
     deriver: AddressDeriver,
     issuer: InvoiceIssuer,
     *,
+    proof_issuer: ProofIssuer | None = None,
     dsn: str | None = None,
     poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
@@ -301,12 +412,25 @@ def serve(
     max_passes: int | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> None:
-    """Answer ``invoice_requests`` until told to stop.
+    """Answer ``invoice_requests`` — and, given ``proof_issuer``, proofs too.
 
     **Two connections, not one.** ``LISTEN`` only delivers on a connection with
     no open transaction, and the working connection spends its life inside one.
     A single-connection version is deaf for exactly the window in which requests
     pile up, which is the window that matters.
+
+    **One listener for both queues.** The second ``LISTEN`` goes on the same
+    connection, so a wakeup from either channel ends the wait and the pass then
+    drains both. That is strictly better than two waits: a notification is only
+    ever a hint here (the pass re-reads regardless), so the cost of being woken
+    by the other queue is one empty claim, and the alternative — a second
+    connection parked on a second wait — would double the idle connections of a
+    process whose whole design story is that it holds exactly one outbound link.
+
+    ``proof_issuer`` is optional so that the invoice queue keeps working on a
+    deploy where 0008 has not been applied yet, and so that a test that cares
+    about issuance does not have to supply a second port. Production always
+    passes one — :func:`core.invoicing.issuer.main` builds both.
 
     ``max_passes`` exists for the tests and for a ``--once`` style operator run;
     ``None`` means forever. ``should_stop`` is a second latch alongside the
@@ -335,27 +459,44 @@ def serve(
     listen_conn = psycopg.connect(target, autocommit=True)
     work_conn = psycopg.connect(target, autocommit=False)
     passes = 0
-    try:
-        listen_for_requests(listen_conn)
-        logger.info(
-            "deriver serving invoice requests (poll=%.1fs, lease=%.0fs)",
-            poll_interval,
-            lease_seconds,
-        )
-        # One sweep before the first wait: a restart inherits whatever the
-        # previous process left in `processing`, and those buyers are already
-        # waiting.
+    def sweep() -> None:
         housekeeping(
             work_conn,
             lease_seconds=lease_seconds,
             max_attempts=max_attempts,
             retention_seconds=retention_seconds,
         )
+        if proof_issuer is not None:
+            housekeeping_proofs(
+                work_conn,
+                lease_seconds=lease_seconds,
+                max_attempts=max_attempts,
+                retention_seconds=retention_seconds,
+            )
+
+    try:
+        listen_for_requests(listen_conn)
+        if proof_issuer is not None:
+            listen_for_proofs(listen_conn)
+        logger.info(
+            "deriver serving invoice requests%s (poll=%.1fs, lease=%.0fs)",
+            " and derivation proofs" if proof_issuer is not None else "",
+            poll_interval,
+            lease_seconds,
+        )
+        # One sweep before the first wait: a restart inherits whatever the
+        # previous process left in `processing`, and those buyers are already
+        # waiting.
+        sweep()
 
         while not stop_now() and (max_passes is None or passes < max_passes):
             passes += 1
             started = time.monotonic()
             outcomes = run_once(work_conn, deriver, issuer, max_attempts=max_attempts)
+            if proof_issuer is not None:
+                outcomes += run_once_proofs(
+                    work_conn, deriver, proof_issuer, max_attempts=max_attempts
+                )
             if outcomes:
                 logger.debug(
                     "pass served %d request(s) in %.0fms",
@@ -369,12 +510,7 @@ def serve(
                 break
             woken = wait_for_request(listen_conn, timeout=poll_interval)
             if not woken:
-                housekeeping(
-                    work_conn,
-                    lease_seconds=lease_seconds,
-                    max_attempts=max_attempts,
-                    retention_seconds=retention_seconds,
-                )
+                sweep()
     finally:
         work_conn.close()
         listen_conn.close()

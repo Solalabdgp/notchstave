@@ -154,16 +154,60 @@ def _refund_requested(payload: Mapping[str, Any]) -> Rendered:
     )
 
 
+def _admin_action(payload: Mapping[str, Any]) -> Rendered:
+    """TZ 5.8/T7 — "уведомление о каждом админ-действии".
+
+    Addressed to the owner and to nobody else: the settler only enqueues this
+    when ``owner_user_id`` is set, and it enqueues it against that user. The
+    third measure against a captured owner account is that it cannot act
+    invisibly to whoever reads the chat history, which requires this message to
+    exist and to be boring — an operator scanning a week of them is looking for
+    the one they did not perform.
+
+    It stays terse. The audit row is the record; this is the tap on the
+    shoulder, and a long message is one that stops being read.
+    """
+    return Rendered(
+        "Admin action recorded.\n"
+        f"Action: {payload['action']}\n"
+        f"Case: {payload['review_id']}\n"
+        f"Invoice: {payload['invoice_id']}\n"
+        f"Outcome: {payload['outcome']} ({payload['amount_usd']} USD)\n"
+        f"Operator: {payload['operator_id']}\n"
+        f"Audit entry: {payload['audit_id']}\n"
+        "If this was not you, treat the account as compromised."
+    )
+
+
+def _reconcile_drift(payload: Mapping[str, Any]) -> Rendered:
+    """TZ 3.4 — "расхождение — сигнал бага, а не повод подправить цифру руками".
+
+    The sentence is in the message because the wrong instinct on reading a drift
+    is to correct the ledger, and the person reading this at three in the
+    morning is the one who can do it.
+    """
+    addresses = payload["addresses"]
+    listed = ", ".join(str(a) for a in addresses[:5])
+    more = "" if len(addresses) <= 5 else f" (+{len(addresses) - 5} more)"
+    return Rendered(
+        "Reconcile found a discrepancy between the ledger and the chain.\n"
+        f"Asset: {payload['asset']} on chain {payload['chain_id']}\n"
+        f"Drift: {payload['drift_usd']} USD ({payload['absolute_drift_raw']} base units)\n"
+        f"Addresses: {listed}{more}\n"
+        "This is a bug signal, not a number to adjust by hand."
+    )
+
+
 #: ``kind`` -> renderer. The keys are exactly the kinds
 #: :mod:`settler.service` and :mod:`settler.admin` enqueue today.
 #:
-#: Two kinds the settler writes are deliberately absent — ``admin_action`` and
-#: ``reconcile_drift``. Both are addressed to the owner, not to a buyer, and
-#: both carry operational detail (drift amounts, admin arguments) that has no
-#: business being formatted by the same code path that talks to customers. They
-#: belong to the bot's owner channel in Week 5. Until that exists they land in
-#: the DLQ by the rule below, which is visible and reversible; inventing a
-#: customer-facing rendering for them would be neither.
+#: The last two are addressed to the owner rather than to a buyer, and they
+#: arrived in Week 5 together with the bot's owner channel. Until then they
+#: landed in the DLQ by the rule below — visible and reversible, which inventing
+#: a customer-facing rendering for them would not have been. They still travel
+#: the same queue at the same priority as everything else: TZ 5.5 allows no
+#: priority column, and an owner notification that could jump the line would be
+#: a second delivery path with its own failure modes.
 RENDERERS: dict[str, Renderer] = {
     "payment_seen": _payment_seen,
     "invoice_settled": _invoice_settled,
@@ -175,6 +219,8 @@ RENDERERS: dict[str, Renderer] = {
     "invoice_manual_review": _invoice_manual_review,
     "invoice_manual_credit": _invoice_manual_credit,
     "refund_requested": _refund_requested,
+    "admin_action": _admin_action,
+    "reconcile_drift": _reconcile_drift,
 }
 
 KINDS_WITH_RENDERERS = frozenset(RENDERERS)

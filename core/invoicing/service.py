@@ -88,6 +88,8 @@ __all__ = [
     "InvoiceView",
     "AddressPool",
     "AddressDeriver",
+    "MacOnly",
+    "MAC_ONLY",
     "create_invoice",
     "verify_invoice_address",
     "load_invoice_by_public_token",
@@ -138,6 +140,52 @@ class AddressPool(Protocol):
         invoice_id: uuid.UUID,
         reserved_from_block: int,
     ) -> Any: ...
+
+
+@dataclass(frozen=True, slots=True)
+class MacOnly:
+    """"I hold the HMAC key and structurally cannot hold the xpub." One sentinel.
+
+    Passed in place of an :class:`AddressDeriver` by a process that is not
+    allowed to re-derive, and there is exactly one of those: ``api``. TZ section
+    9 gives ``LoadCredential=`` with the xpub to ``notchstave-deriver.service``
+    and to no other unit, and ``hd_accounts`` deliberately stores only the
+    4-byte fingerprint (see its model docstring), so there is no third place an
+    ``api`` process could obtain one. ``INVOICE_INTEGRITY_KEY``, by contrast, is
+    scoped to settler/api/bot by the same section.
+
+    **What is given up, stated exactly**, because a countermeasure described
+    without its boundary is advertising (the TZ's own standard for T1.3). With
+    this sentinel the T1.1 derivation check does not run at display time; the
+    T1.3 MAC check does, over the full significant tuple including the address.
+    What still holds:
+
+    * the address was re-derived and compared by the deriver at issuance —
+      :func:`create_invoice` step 5, in the same transaction that wrote the row;
+    * ``receive_addresses`` is writable only by ``notchstave_deriver``
+      (migration 0002, TZ 5.8/T1.2), so an address cannot be *declared* into the
+      pool by a compromised ``api``;
+    * the MAC binds ``(invoice_id, chain_id, asset_id, address, amount_due_raw,
+      expires_at)`` under a key that is not in the database, so the DB-only
+      compromise of T1 vector 1 — leaked replica, stolen backup, forgotten port
+      forward — still cannot rewrite the displayed address into a verifying row.
+
+    What is lost is the case where the attacker holds the database *and*
+    ``INVOICE_INTEGRITY_KEY``. That key lives on the ``api`` host, so this is
+    the full-host compromise the TZ already excludes from the HMAC's promise.
+
+    The stronger arrangement is an ``api`` that asks the deriver process to
+    verify over the ``invoice_requests``-style channel of migration 0007, and
+    then passes a real :class:`AddressDeriver` here instead. Nothing in this
+    module needs to change for that — which is the point of the sentinel being a
+    distinct type rather than ``None``: it is greppable, it cannot be arrived at
+    by forgetting an argument, and the day the RPC lands the call sites that
+    still say ``MAC_ONLY`` are the exact list of what is left to move.
+    """
+
+
+#: The one instance. See :class:`MacOnly`.
+MAC_ONLY = MacOnly()
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +388,7 @@ def _view_from_row(row: dict[str, Any], *, newly_derived: bool = False) -> Invoi
 
 def _check_integrity(
     view: InvoiceView,
-    deriver: AddressDeriver,
+    deriver: AddressDeriver | MacOnly,
     key: IntegrityKey,
 ) -> None:
     """The two T1 checks, in the order that makes the alert legible.
@@ -356,8 +404,13 @@ def _check_integrity(
     Both raise. Neither returns a boolean, because a boolean is a value a caller
     can forget to look at, and "forgot to check" must not be a way to show an
     unverified address.
+
+    :data:`MAC_ONLY` skips the first check and only the first check — see
+    :class:`MacOnly` for which process passes it and exactly what that costs.
     """
-    if not deriver.verify(view.address, view.hd_account_id, view.derivation_index):
+    if isinstance(deriver, MacOnly):
+        pass
+    elif not deriver.verify(view.address, view.hd_account_id, view.derivation_index):
         ADDRESS_MISMATCH.inc()
         raise AddressMismatch(
             f"invoice {view.invoice_id}: address {view.address} does not re-derive from "
@@ -387,7 +440,7 @@ def _check_integrity(
 
 def verify_invoice_address(
     conn: psycopg.Connection[Any],
-    deriver: AddressDeriver,
+    deriver: AddressDeriver | MacOnly,
     key: IntegrityKey,
     invoice_id: uuid.UUID,
     *,
@@ -430,13 +483,18 @@ def verify_invoice_address(
 
 def load_invoice_by_public_token(
     conn: psycopg.Connection[Any],
-    deriver: AddressDeriver,
+    deriver: AddressDeriver | MacOnly,
     key: IntegrityKey,
     token: str,
     *,
     now: dt.datetime | None = None,
 ) -> InvoiceView:
     """Same guarantees, keyed by the public page token (TZ 5.8/T1.7).
+
+    ``deriver`` may be :data:`MAC_ONLY` when the calling process cannot hold an
+    xpub; :class:`MacOnly` documents which guarantee that drops and which
+    survive. Every other guarantee below is unchanged by that choice — in
+    particular the TTL, which is enforced here and not in the token.
 
     The token's TTL is *"срок жизни инвойса + окно доплаты"* (TZ 6) and is
     enforced here as a lookup against ``topup_window_until`` rather than encoded

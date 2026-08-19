@@ -5,11 +5,16 @@
 # would add minutes to every run for no coverage. Pins MUST match the root
 # pyproject.toml where a package appears in both.
 #
-# aiogram is absent, and that absence is the point of Week 4's design: the
-# delivery loop, the retry curve, the DLQ and the rate limiter are all tested
-# without a Telegram client existing, through the `MessageSender` protocol.
-# When Week 5 adds the aiogram sender, this file gains one line and none of
-# these tests change.
+# aiogram was absent through Week 4, and that absence was the point of the
+# design: the delivery loop, the retry curve, the DLQ and the rate limiter were
+# all tested without a Telegram client existing, through the `MessageSender`
+# protocol. Week 5 added `notifier/telegram.py`, so this file gained the one
+# line below and not one of those tests changed — which is the claim the
+# protocol was written to make good on.
+#
+# Everything except `test_aiogram_sender.py` still runs without it: that module
+# opens with `pytest.importorskip("aiogram")`, so a deployment that installs
+# only the delivery dependencies gets a skip rather than a collection error.
 #
 # `redis` IS here, unlike in settler/tests, because the rate limiter's Redis
 # path is real code with a Lua script in it — the one thing in this package that
@@ -18,6 +23,7 @@
 #
 # Versions resolved against the PyPI JSON API on 2026-08-19, not from memory.
 
+aiogram==3.30.0
 sqlalchemy==2.0.52
 greenlet==3.5.5
 psycopg[binary]==3.3.4

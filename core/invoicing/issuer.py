@@ -71,14 +71,21 @@ import os
 from typing import Any, Protocol
 
 import psycopg
+from psycopg.rows import dict_row
 
-from core.invoicing import wire
+from core.invoicing import proof_wire, wire
 from core.invoicing.config import DEFAULT_POLICY, InvoicingPolicy
 from core.invoicing.errors import InvoicingError, QuotaExceeded
 from core.invoicing.integrity import IntegrityKey, load_integrity_key
+from core.invoicing.proof_wire import DerivationProof, compute_proof_mac
 from core.invoicing.quotas import QuotaCache
 from core.invoicing.rates import RateSource
-from core.invoicing.service import AddressPool, InvoiceView, create_invoice
+from core.invoicing.service import (
+    AddressPool,
+    InvoiceView,
+    create_invoice,
+    verify_invoice_address,
+)
 from deriver import main as deriver_main
 from deriver import pool as deriver_pool
 from deriver.requests import (
@@ -86,10 +93,12 @@ from deriver.requests import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_RETENTION_SECONDS,
     IssuedInvoice,
+    ProvenAddress,
     RefusedInvoice,
+    RefusedProof,
 )
 
-__all__ = ["InvoiceIssuer", "build_issuer", "main"]
+__all__ = ["InvoiceIssuer", "ProofIssuer", "build_issuer", "build_proof_issuer", "main"]
 
 log = logging.getLogger("notchstave.issuer")
 
@@ -119,6 +128,32 @@ class InvoiceIssuer(Protocol):
     def __call__(
         self, conn: psycopg.Connection[Any], deriver: Any, request: Any
     ) -> Any: ...
+
+
+class ProofIssuer(Protocol):
+    """:class:`deriver.requests.ProofIssuer`, restated on this side of the seam.
+
+    Declared again rather than imported, for the same ``follow_imports = skip``
+    reason :class:`InvoiceIssuer` gives above.
+    """
+
+    def __call__(
+        self, conn: psycopg.Connection[Any], deriver: Any, request: Any
+    ) -> Any: ...
+
+
+#: The external chain of BIP-44: ``m/44'/60'/<account>'/0/<index>``. Change
+#: addresses do not exist in this system — every derived address is one an
+#: outsider is asked to pay — so this is a constant rather than a column, and
+#: naming it once here keeps the path in the published proof identical to the
+#: path ``deriver.derivation`` actually derives at.
+EXTERNAL_CHAIN = 0
+
+SQL_ACCOUNT_PATH = """
+SELECT path_prefix, xpub_fingerprint
+  FROM hd_accounts
+ WHERE id = %(hd_account_id)s
+"""
 
 
 def _error_detail(exc: InvoicingError) -> str | None:
@@ -204,6 +239,111 @@ def build_issuer(
     return issue
 
 
+def build_proof_issuer(key: IntegrityKey) -> ProofIssuer:
+    """The ``/verify`` port: prove one invoice's address, or refuse (TZ 5.8/T1.4).
+
+    Four steps, and the order is the argument for the command existing at all:
+
+    1. :func:`~core.invoicing.service.verify_invoice_address` with
+       ``expected_user_id``. That single call is the ownership filter of T1.7,
+       the re-derivation of T1.1 and the invoice MAC check of T1.3 — so a proof
+       is never built for an invoice whose address has already failed its own
+       checks. Publishing a "proof" of a substituted address would be the worst
+       possible outcome of this feature and this line is what forecloses it.
+    2. Read ``path_prefix`` from ``hd_accounts``, and compare the row's
+       ``xpub_fingerprint`` against the one the *loaded key* produces. The
+       fingerprint that goes out is the deriver's, never the row's: publishing
+       the row's value would make the proof a restatement of the database, which
+       is the thing the reader is trying to check. A disagreement means this
+       process is holding a different key from the one the account claims —
+       realistically a half-finished rotation (T4) — and it refuses.
+    3. Derive the address again through the same object, at the path being
+       published, and compare. Step 1 already did this; doing it again against
+       the *composed path string* is what makes the published path and the
+       published address provably the same fact rather than two adjacent ones.
+    4. MAC the triple and hand it to the queue.
+
+    Refusals are values, exceptions are exceptions — the split
+    :class:`~deriver.requests.ProofIssuer` needs in order to know whether a
+    retry could ever help.
+    """
+
+    def prove(conn: psycopg.Connection[Any], deriver: Any, request: Any) -> Any:
+        try:
+            view: InvoiceView = verify_invoice_address(
+                conn,
+                deriver,
+                key,
+                request.invoice_id,
+                expected_user_id=request.user_id,
+            )
+        except InvoicingError as exc:
+            log.warning(
+                "proof request %s refused (%s): %s",
+                request.request_id,
+                type(exc).__name__,
+                exc,
+            )
+            return RefusedProof(
+                error_code=type(exc).__name__, error_message=exc.user_message
+            )
+
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(SQL_ACCOUNT_PATH, {"hd_account_id": view.hd_account_id})
+            account = cur.fetchone()
+        if account is None:  # pragma: no cover - FK on receive_addresses forbids it
+            raise RuntimeError(f"hd_account {view.hd_account_id} vanished mid-proof")
+
+        fingerprint = str(deriver.fingerprint(view.hd_account_id))
+        if fingerprint != str(account["xpub_fingerprint"]):
+            log.error(
+                "hd_account %s claims fingerprint %s, the loaded key produces %s",
+                view.hd_account_id,
+                account["xpub_fingerprint"],
+                fingerprint,
+            )
+            return RefusedProof(
+                error_code="AddressMismatch",
+                error_message=(
+                    "This invoice cannot be proven right now. Do not send any funds "
+                    "and please contact support."
+                ),
+            )
+
+        path = f"{str(account['path_prefix']).rstrip('/')}/{EXTERNAL_CHAIN}/{view.derivation_index}"
+        derived = str(deriver.address(view.hd_account_id, view.derivation_index))
+        if derived.lower() != view.address.lower():  # pragma: no cover - step 1 covers it
+            return RefusedProof(
+                error_code="AddressMismatch",
+                error_message=(
+                    "This invoice failed a security check and cannot be proven. "
+                    "Do not send any funds. Please contact support."
+                ),
+            )
+
+        proof = DerivationProof(
+            invoice_id=view.invoice_id,
+            xpub_fingerprint=fingerprint,
+            derivation_path=path,
+            derivation_index=view.derivation_index,
+            # The address from the *verified view*, not the freshly derived
+            # string: they are equal by the check above, and using the view's
+            # keeps the published address byte-identical to the EIP-55 form the
+            # buyer was shown, which is the comparison T1.4 asks them to make.
+            address=view.address,
+            proof_mac=compute_proof_mac(
+                key,
+                invoice_id=view.invoice_id,
+                xpub_fingerprint=fingerprint,
+                derivation_path=path,
+                address=view.address,
+            ),
+        )
+        return ProvenAddress(result_json=json.dumps(proof_wire.to_wire(proof)))
+
+    return prove
+
+
 def main(argv: list[str] | None = None) -> int:
     """Start the deriver process: load the keys, then answer invoice requests.
 
@@ -232,6 +372,11 @@ def main(argv: list[str] | None = None) -> int:
     deriver_main.serve(
         deriver,
         build_issuer(key, policy=policy),
+        # Both ports, one loop, one pair of connections. `/verify` is a read and
+        # `/buy` is a write, but they need the same two things — the xpub and the
+        # ability to answer a queue — so splitting them into two processes would
+        # mean two copies of the credential for no isolation gained.
+        proof_issuer=build_proof_issuer(key),
         poll_interval=float(
             os.environ.get(
                 "DERIVER_POLL_INTERVAL_SECONDS", deriver_main.DEFAULT_POLL_INTERVAL_SECONDS

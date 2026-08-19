@@ -188,6 +188,17 @@ class FakeDeriver:
     def verify(self, address: str, hd_account_id: int, derivation_index: int) -> bool:
         return address.lower() == self.address(hd_account_id, derivation_index).lower()
 
+    def fingerprint(self, hd_account_id: int) -> str:
+        """What :meth:`deriver.service.Deriver.fingerprint` returns, faked.
+
+        Fixed at ``deadbeef`` to match the ``xpub_fingerprint`` :meth:`World
+        .hd_account` writes, because the proof issuer compares the two: a
+        deriver whose loaded key disagrees with the row it is deriving for is a
+        half-finished rotation (TZ 5.8/T4), and the whole value of the command
+        is that it refuses to publish a proof it cannot stand behind.
+        """
+        return "deadbeef"
+
 
 @pytest.fixture
 def deriver() -> FakeDeriver:
