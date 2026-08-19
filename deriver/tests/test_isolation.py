@@ -16,6 +16,41 @@ head "just for reserved_from_block", and the process holding the xpub gains an
 outbound socket. That is not a hypothetical — needing the block height at
 reservation time (TZ 5.1 p. 2, condition 3) creates exactly that temptation.
 The height is passed in as an argument for this reason.
+
+----
+
+**What changed when the deriver started answering invoice requests, and what
+did not.**
+
+Migration 0006 moved invoice issuance behind the ``notchstave_deriver`` role, so
+``core.invoicing.service.create_invoice`` now runs in this process — and
+``core`` may still not be imported from this package. Dependency inversion is
+what makes both true at once: ``deriver.requests`` declares the port,
+``deriver.main`` runs the loop, and ``core.invoicing.issuer`` supplies the
+implementation and is the process's actual entry point.
+
+The transport for those requests is a Postgres table plus ``LISTEN``/``NOTIFY``
+(migration 0007) rather than a socket, which is why every assertion below is
+unchanged. The deriver holds the one connection it always held. Nothing in this
+file was relaxed to accommodate the new capability, and if a future change wants
+that, this paragraph is the thing it has to argue with.
+
+Two allow-list entries did move, both stdlib, both in ``deriver/main.py``:
+``signal`` (a serving loop needs a shutdown latch, and ``asyncio`` — the usual
+answer — is forbidden here) and ``types`` (the ``FrameType`` in the signal
+handler's annotation). Neither can open anything.
+
+**The gap this file cannot close, stated rather than implied.** These tests
+prove the *package* is clean. The *process* is a composition of this package and
+``core.invoicing``, so :func:`test_the_issuer_process_pulls_in_no_network_
+capable_repo_module` walks the in-repo import closure from the composition root
+and applies the same forbidden list — which catches the realistic erosion, an
+``httpx`` added to ``core.invoicing.rates`` for a live price feed. What no test
+here can reach is the third-party closure: ``prometheus_client`` can serve HTTP
+and ``sqlalchemy`` can open a connection. The control for that is the unit file,
+not a test — ``notchstave-deriver.service`` runs with ``IPAddressDeny=any`` and
+``RestrictAddressFamilies=AF_UNIX AF_INET``, reaching Postgres over the local
+socket. A test that pretended to cover it would be worse than the honest note.
 """
 
 from __future__ import annotations
@@ -173,8 +208,100 @@ _STDLIB_ALLOWLIST = frozenset(
         "sys",
         "time",
         "traceback",
+        # Added with the request loop (migration 0007). `signal` is how
+        # `deriver.main.serve` latches SIGTERM — the usual answer, an
+        # `asyncio.Event`, is on the forbidden list above and staying there.
+        # `types` is `FrameType` in the handler's annotation and nothing else.
+        # Neither can open a socket, a file or a subprocess.
+        "signal",
+        "types",
     }
 )
+
+
+#: The module ``notchstave-deriver.service`` actually runs. Everything the
+#: xpub-holding process can import that lives in this repository is reachable
+#: from here.
+COMPOSITION_ROOT = REPO_ROOT / "core" / "invoicing" / "issuer.py"
+
+
+def _module_paths(module: str) -> list[Path]:
+    """Every in-repo file a dotted name could refer to. Empty for third parties.
+
+    Both candidates are returned because ``from core.db import enums`` names a
+    package and a module in one statement, and following only one of them would
+    leave half the closure unwalked — which is the half a network import would
+    hide in.
+    """
+    parts = module.split(".")
+    if not parts or parts[0] not in {"core", "deriver", "bot", "api", "watcher", "settler"}:
+        return []
+    base = REPO_ROOT.joinpath(*parts)
+    return [p for p in (base.with_suffix(".py"), base / "__init__.py") if p.is_file()]
+
+
+def _repo_import_closure(entry: Path) -> set[Path]:
+    """Transitively walk in-repo imports, breadth first, cycle safe."""
+    seen: set[Path] = {entry}
+    frontier = [entry]
+    while frontier:
+        current = frontier.pop()
+        tree = ast.parse(current.read_text(encoding="utf-8"), filename=str(current))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names.add(node.module)
+                names.update(f"{node.module}.{alias.name}" for alias in node.names)
+        for name in names:
+            for path in _module_paths(name):
+                if path not in seen:
+                    seen.add(path)
+                    frontier.append(path)
+    return seen
+
+
+def test_the_composition_root_is_where_this_file_says_it_is() -> None:
+    """Guards the test below against silently walking nothing.
+
+    If ``core/invoicing/issuer.py`` is renamed, the closure check becomes a test
+    of an empty set and passes forever. This is the tripwire for that.
+    """
+    assert COMPOSITION_ROOT.is_file()
+    assert "deriver" in COMPOSITION_ROOT.read_text(encoding="utf-8")
+
+
+def test_the_issuer_process_pulls_in_no_network_capable_repo_module() -> None:
+    """The process-level counterpart to the package-level checks above.
+
+    The deriver package cannot import ``core``, but the process that holds the
+    xpub now runs both halves (see the module docstring). This walks every
+    in-repo module reachable from the composition root and applies the same
+    forbidden list — so the realistic erosion, an ``httpx`` added to
+    ``core.invoicing.rates`` for a live price feed, fails the build in the file
+    that would cause it rather than in a post-mortem.
+
+    ``urllib`` and ``http`` are not exempted for ``core`` either. If a module in
+    that closure genuinely needs one, the right move is to keep it out of the
+    closure, not to widen this list.
+    """
+    closure = _repo_import_closure(COMPOSITION_ROOT)
+
+    # Sanity: the walk reached both halves of the composition.
+    assert any(p.parts[-2:] == ("invoicing", "service.py") for p in closure)
+    assert any(p.parts[-2:] == ("deriver", "requests.py") for p in closure)
+
+    offenders = {
+        path.relative_to(REPO_ROOT).as_posix(): sorted(offending)
+        for path in sorted(closure)
+        if (offending := imported_root_modules(path) & FORBIDDEN_NETWORK_MODULES)
+    }
+
+    assert not offenders, (
+        "the xpub-holding process would import network-capable module(s) "
+        f"through its composition root: {offenders}"
+    )
 
 
 def test_pyproject_dependency_list_has_not_grown() -> None:

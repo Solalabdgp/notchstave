@@ -37,6 +37,9 @@ __all__ = [
     "HourlyQuotaExceeded",
     "BehaviouralCooldown",
     "AddressCapacityExhausted",
+    "InvoiceRequestInFlight",
+    "InvoiceRequestTimeout",
+    "InvoiceRequestAbandoned",
     "InvoiceNotFound",
     "IntegrityFailure",
     "AddressMismatch",
@@ -178,6 +181,64 @@ class AddressCapacityExhausted(InvoiceUnavailable):
 
     user_message = (
         "We cannot open a new payment address at the moment. Please try again in a few minutes."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The ask-the-deriver round trip (migration 0007)
+# ---------------------------------------------------------------------------
+#
+# Issuance happens in the deriver process, so a `/buy` can now fail in ways that
+# have nothing to do with the invoice: the request never got picked up, or the
+# caller stopped waiting. Those live here rather than in the client module,
+# because a bot that catches `InvoiceUnavailable` should not have to import a
+# second exception hierarchy to catch the whole set.
+
+
+class InvoiceRequestInFlight(InvoiceUnavailable):
+    """This user already has an unanswered request (0007's unique index).
+
+    The cheapest of the T5.1 quotas and the first one a double-tapped button
+    meets: one open request per user, enforced by
+    ``uq_invoice_requests_one_open_per_user`` at INSERT time, before an advisory
+    lock has been taken or a count has been read. Normal use never sees it —
+    the window it guards is the few milliseconds a request is in flight.
+    """
+
+    user_message = "We are already creating an invoice for you. One moment."
+
+
+class InvoiceRequestTimeout(InvoiceUnavailable):
+    """The caller stopped waiting. **Not** proof that nothing was issued.
+
+    The request row stays where it is and the deriver may still answer it, so
+    the honest message is "we do not know yet", never "that failed". A buyer who
+    is told it failed will press ``/buy`` again; a buyer who is told to check is
+    pointed at ``/status``, where a successfully issued invoice is waiting.
+
+    In practice this means the deriver is down or the database is unreachable:
+    the expected round trip is one ``NOTIFY`` hop, three orders of magnitude
+    inside the default deadline.
+    """
+
+    user_message = (
+        "This is taking longer than usual. Your invoice may still be on its way — "
+        "check /status in a moment before trying again."
+    )
+
+
+class InvoiceRequestAbandoned(InvoiceUnavailable):
+    """The deriver tried, failed repeatedly, and said so.
+
+    Distinct from a timeout because it is a *finished* request: nothing was
+    issued, nothing is pending, and retrying is the right advice. The class name
+    is also the ``error_code`` the deriver writes (``deriver.requests
+    .ABANDONED_ERROR_CODE``), which is what lets the client map it back without
+    a translation table.
+    """
+
+    user_message = (
+        "We could not create this invoice. Nothing was charged — please try again."
     )
 
 

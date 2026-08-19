@@ -178,6 +178,103 @@ def test_the_deriver_cannot_rewrite_an_invoice_it_issued(
     conn.rollback()
 
 
+@pytest.mark.parametrize("role", [API_ROLE, BOT_ROLE])
+def test_bot_and_api_may_ask_for_an_invoice_and_may_not_answer(
+    conn: psycopg.Connection[Any], world: World, role: str
+) -> None:
+    """Migration 0007's asymmetry, which is where its security lives.
+
+    A ``bot`` that could UPDATE ``invoice_requests`` could write its own reply —
+    ``status='done'`` with a ``result_json`` naming any address it liked — and
+    the buyer would be shown it. That is precisely the capability 0006 took away
+    by moving INSERT on ``invoices`` to the deriver, so leaving it available one
+    table over would have undone the whole revision. The MAC check in
+    ``core.invoicing.client`` is the second line here; this is the first.
+    """
+    shop = world.shop()
+
+    with conn.cursor() as cur:
+        cur.execute(f"SET ROLE {role}")
+        cur.execute(
+            """
+            INSERT INTO invoice_requests (id, user_id, product_id, chain_id, asset_id,
+                                          hd_account_id)
+            VALUES (gen_random_uuid(), %(u)s, %(p)s, %(c)s, %(a)s, %(h)s)
+            RETURNING id
+            """,
+            {
+                "u": shop.user_id,
+                "p": shop.product_id,
+                "c": shop.chain_id,
+                "a": shop.asset_id,
+                "h": shop.hd_account_id,
+            },
+        )
+        row = cur.fetchone()
+        assert row is not None
+
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute("UPDATE invoice_requests SET status = 'done'")
+    conn.rollback()
+
+    with conn.cursor() as cur:
+        cur.execute(f"SET ROLE {role}")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute("DELETE FROM invoice_requests")
+    conn.rollback()
+
+
+def test_the_deriver_may_answer_a_request_and_may_not_create_one(
+    conn: psycopg.Connection[Any], world: World
+) -> None:
+    """The other half of the asymmetry, and it is a T5 measure rather than a T1 one.
+
+    Every quota in TZ 5.8/T5 sits on the way *in* — the one-open-per-user index
+    at INSERT, the hourly and active-invoice counts inside ``create_invoice``.
+    A process that could enqueue its own work would be on the wrong side of all
+    of them. The deriver answers questions; it does not get to ask any.
+    """
+    shop = world.shop()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO invoice_requests (id, user_id, product_id, chain_id, asset_id,
+                                          hd_account_id)
+            VALUES (gen_random_uuid(), %(u)s, %(p)s, %(c)s, %(a)s, %(h)s)
+            """,
+            {
+                "u": shop.user_id,
+                "p": shop.product_id,
+                "c": shop.chain_id,
+                "a": shop.asset_id,
+                "h": shop.hd_account_id,
+            },
+        )
+    conn.commit()
+
+    with conn.cursor() as cur:
+        cur.execute(f"SET ROLE {DERIVER_ROLE}")
+        # Claiming and answering: the two writes the loop actually performs.
+        cur.execute("UPDATE invoice_requests SET status = 'processing', claimed_at = now()")
+        cur.execute("DELETE FROM invoice_requests WHERE status = 'done'")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                """
+                INSERT INTO invoice_requests (id, user_id, product_id, chain_id, asset_id,
+                                              hd_account_id)
+                VALUES (gen_random_uuid(), %(u)s, %(p)s, %(c)s, %(a)s, %(h)s)
+                """,
+                {
+                    "u": shop.user_id,
+                    "p": shop.product_id,
+                    "c": shop.chain_id,
+                    "a": shop.asset_id,
+                    "h": shop.hd_account_id,
+                },
+            )
+    conn.rollback()
+
+
 def test_no_role_can_erase_the_issuance_from_the_audit_log(
     conn: psycopg.Connection[Any], world: World, deriver: FakeDeriver, key: IntegrityKey
 ) -> None:

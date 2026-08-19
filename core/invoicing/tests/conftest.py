@@ -81,6 +81,10 @@ DEFAULT_URL = "postgresql+psycopg://notchstave:testpw@localhost:55432/notchstave
 #: the foreign keys; ``RESTART IDENTITY`` lets an assertion name "address 1"
 #: without depending on how many tests ran before.
 _DATA_TABLES = (
+    # First, because it references `invoices` and `users`. `CASCADE` would sort
+    # it out anyway; naming it explicitly means a reader of this tuple can see
+    # the whole write set of `/buy` without going to look at the migrations.
+    "invoice_requests",
     "audit_log",
     "notifications",
     "manual_reviews",
