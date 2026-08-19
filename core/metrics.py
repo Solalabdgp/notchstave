@@ -3,11 +3,14 @@
 Almost every metric in TZ section 7 has exactly one owner, and
 :mod:`watcher.metrics` states the rule this module exists to keep: *"a metric
 declared by two processes is a metric that reads differently depending on which
-one scraped last."* Two families break the one-owner pattern honestly, because
+one scraped last."* Five families break the one-owner pattern honestly, because
 two processes genuinely observe the same event from different sides:
 
     notchstave_orphan_payments_total{chain}
     notchstave_unassigned_payments_total{chain}
+    notchstave_address_mismatch_total
+    notchstave_invoice_mac_failures_total
+    notchstave_active_reserved_addresses{chain}
 
 The **watcher** classifies an incoming transfer as ``orphan_payment`` or
 ``unassigned_payment`` — it is the only component that sees the block. The
@@ -15,6 +18,19 @@ The **watcher** classifies an incoming transfer as ``orphan_payment`` or
 (``settler.service.review_anomalous_payments``), and TZ section 7's alert
 ("`orphan_payments_total` вырос → обязателен ручной разбор") is about the second
 event, not the first.
+
+The next two are the T1 security counters, and TZ 5.8/T1.1 and T1.3 name their
+observation points explicitly: the address is re-derived and the MAC re-checked
+*"перед отправкой сообщения с адресом, при рендере страницы инвойса, при зачёте
+в settler"* — three call sites in three processes. A counter whose whole meaning
+is "somebody, somewhere, saw a tampered invoice" cannot be owned by one of them.
+
+``notchstave_active_reserved_addresses`` moved here for the same reason in Week
+5. The watcher sets it from the filter it is about to build; the invoicing
+service sets it the moment it takes an address out of the pool, which is the
+earlier and more actionable of the two readings — the T5 alert fires at 80% of
+the ceiling, and waiting for the next watcher pass to notice is a scrape
+interval of blindness during exactly the burst the alert is for.
 
 Declaring the family twice does not merely produce two readings: it raises
 ``DuplicateTimeseries`` the instant one process imports both packages. That
@@ -41,6 +57,9 @@ __all__ = [
     "PROMETHEUS_AVAILABLE",
     "orphan_payments_total",
     "unassigned_payments_total",
+    "address_mismatch_total",
+    "invoice_mac_failures_total",
+    "active_reserved_addresses",
 ]
 
 
@@ -67,11 +86,11 @@ class _NoopMetric:
 
 
 try:  # pragma: no cover - exercised implicitly by whichever env runs the tests
-    from prometheus_client import Counter
+    from prometheus_client import Counter, Gauge
 
     PROMETHEUS_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    Counter = _NoopMetric  # type: ignore[assignment, misc]
+    Counter = Gauge = _NoopMetric  # type: ignore[assignment, misc]
     PROMETHEUS_AVAILABLE = False
 
 
@@ -89,5 +108,44 @@ orphan_payments_total = Counter(
 unassigned_payments_total = Counter(
     "notchstave_unassigned_payments_total",
     "Payments to a known address with no live invoice behind it.",
+    ["chain"],
+)
+
+#: TZ 5.8/T1.1 — the address stored against an invoice did not re-derive from
+#: the account xpub. Normal value is zero and stays zero forever; the alert in
+#: TZ section 7 is ``> 0``, with no rate and no threshold, because there is no
+#: benign reading of this number.
+#:
+#: Unlabelled on purpose. A ``{chain}`` or ``{invoice}`` label would invite the
+#: question "which chain is compromised", and the answer to a non-zero value is
+#: not "look at the label" — it is "stop issuing invoices and go and look at the
+#: database". Anything that makes this counter feel like a dashboard series
+#: rather than a fire alarm works against it.
+address_mismatch_total = Counter(
+    "notchstave_address_mismatch_total",
+    "Invoice addresses that failed to re-derive from the xpub (TZ 5.8/T1.1). "
+    "Normal value is zero; any increment is a suspected compromise.",
+)
+
+#: TZ 5.8/T1.3 — ``integrity_mac`` did not match a re-computation over the
+#: invoice's significant tuple. Same reading, different tamper: the address may
+#: still derive correctly while the amount, the chain or the deadline was
+#: edited underneath it.
+invoice_mac_failures_total = Counter(
+    "notchstave_invoice_mac_failures_total",
+    "Invoices whose integrity_mac did not verify (TZ 5.8/T1.3). "
+    "Normal value is zero; any increment means the row was changed outside the app.",
+)
+
+#: TZ 5.8/T5.2 — how much of the derivation account's ceiling is in use. Alert
+#: at 80%, because the ceiling is what bounds the ``eth_getLogs`` filter and the
+#: damage in T5 is degraded payment detection, not disk.
+#:
+#: A Gauge with two writers in two processes (see the module docstring). Both
+#: report a count of reserved addresses; the invoicing service reports it at the
+#: moment the count changes, the watcher when it rebuilds its filter.
+active_reserved_addresses = Gauge(
+    "notchstave_active_reserved_addresses",
+    "Receive addresses currently reserved by a live invoice (TZ 5.8/T5.2).",
     ["chain"],
 )

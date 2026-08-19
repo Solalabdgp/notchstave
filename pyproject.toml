@@ -90,6 +90,19 @@ strict = true
 # type-checked separately for the same reason it is dependency-isolated.
 exclude = ["deriver/", "migrations/versions/"]
 
+# `exclude` only stops mypy from *crawling* into deriver/; it still follows an
+# import that reaches it, which is what happens the moment anything wires the
+# address pool up (core/invoicing/tests/conftest.py does exactly that, on
+# purpose — the pool's reservation SQL is under test and must not be re-mocked).
+# Following the import would type-check deriver/ under this environment's
+# dependency set, which is the opposite of what the exclusion is for. Skipping
+# gives the caller `Any` at the boundary, which is honest: `core.invoicing`
+# talks to the pool through the structural `AddressPool` / `AddressDeriver`
+# protocols in core/invoicing/service.py, and those are checked.
+[[tool.mypy.overrides]]
+module = "deriver.*"
+follow_imports = "skip"
+
 [tool.pytest.ini_options]
 # deriver/tests is deliberately absent: the deriver installs into its own
 # isolated environment (deriver/pyproject.toml) precisely so that this one
@@ -101,7 +114,13 @@ exclude = ["deriver/", "migrations/versions/"]
 # schema: the notifier's whole input is the table the settler writes, and a
 # disagreement between the two about the outbox contract should fail in one run
 # rather than in two that pass separately.
-testpaths = ["settler/tests", "notifier/tests"]
+#
+# core/invoicing/tests joins them for the same reason and adds one of its own:
+# it is the suite that proves migration 0006's deferred foreign key shipped, and
+# a settler run against a database where that migration had not been applied
+# would be testing a different schema from the one production gets. One run, one
+# `alembic upgrade head`, one answer.
+testpaths = ["settler/tests", "notifier/tests", "core/invoicing/tests"]
 
 # The settler suite talks to a real Postgres over an async engine, so every
 # test in it is a coroutine. `auto` keeps the marker off ~40 test functions

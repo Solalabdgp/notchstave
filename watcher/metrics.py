@@ -135,20 +135,18 @@ getlogs_filter_size = Gauge(
     ["chain"],
 )
 
-active_reserved_addresses = Gauge(
-    "notchstave_active_reserved_addresses",
-    "Receive addresses currently reserved by a live invoice.",
-    ["chain"],
-)
-
-# Re-exported, not re-declared. These two families are incremented by the
-# watcher (which classifies the anomaly) and by the settler (which opens the
-# case), and the docstring at the top of this module is the reason that has to be
-# one collector rather than two: a name claimed twice raises DuplicateTimeseries
-# the moment a single process imports both packages, which is exactly what
-# `/reconcile` does since it reuses this package's RPC pool. See core/metrics.py.
+# Re-exported, not re-declared. These families are written by the watcher (which
+# classifies the anomaly, and which counts the addresses going into its filter)
+# and by another process that observes the same fact from the other side — the
+# settler, which opens the manual-review case, and the invoicing service, which
+# is what makes an address reserved in the first place. The docstring at the top
+# of this module is the reason that has to be one collector rather than two: a
+# name claimed twice raises DuplicateTimeseries the moment a single process
+# imports both packages, which is exactly what `/reconcile` does since it reuses
+# this package's RPC pool. See core/metrics.py.
 orphan_payments_total = core_metrics.orphan_payments_total
 unassigned_payments_total = core_metrics.unassigned_payments_total
+active_reserved_addresses = core_metrics.active_reserved_addresses
 
 breaker_state = Gauge(
     "notchstave_rpc_breaker_state",

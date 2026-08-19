@@ -1,0 +1,20 @@
+# Test environment for invoice issuance (TZ section 8).
+#
+# Deliberately smaller than settler/tests/requirements.txt, and the difference
+# is the point: this suite talks to PostgreSQL through psycopg directly, not
+# through SQLAlchemy's async engine, because `deriver.pool` — which owns the
+# reservation SQL under test — is synchronous psycopg. So no sqlalchemy and no
+# greenlet here.
+#
+# `alembic` is still needed: the schema is built by the real migrations, since
+# the deferred foreign key of 0006 and the triggers of 0001 do not exist in
+# `Base.metadata.create_all`. Alembic pulls sqlalchemy in as its own dependency,
+# which is fine — the tests do not import it.
+#
+# The pins MUST match the root pyproject.toml where a package appears in both.
+
+psycopg[binary]==3.3.4
+alembic==1.19.1
+prometheus-client==0.26.0
+
+pytest==9.1.1
