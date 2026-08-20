@@ -108,9 +108,10 @@ services:
         pip install -q -r settler/tests/requirements.txt \
                        -r notifier/tests/requirements.txt \
                        -r core/invoicing/tests/requirements.txt \
-                       -r bot/tests/requirements.txt
+                       -r bot/tests/requirements.txt \
+                       -r api/tests/requirements.txt
         alembic upgrade head
-        pytest settler/tests notifier/tests core/invoicing/tests bot/tests -v
+        pytest settler/tests notifier/tests core/invoicing/tests bot/tests api/tests -v
 
 volumes:
   notchstave_test_pipcache:

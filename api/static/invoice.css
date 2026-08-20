@@ -1,0 +1,184 @@
+/* Invoice page styling. Self-hosted, one file, no imports.
+ *
+ * `@import` and `url()` are both absent on purpose: `default-src 'self'` would
+ * block a remote one anyway, but the point of TZ 5.8/T1.6 is that the page has
+ * no external dependency at all, and a stylesheet that reaches for a font is an
+ * external dependency that happens to be currently blocked.
+ *
+ * The system font stack is used for the same reason. A web font on this page
+ * would be a third party in a position to observe every invoice view, and — via
+ * a swapped glyph — in a position to change what an address *looks* like
+ * without changing what it says.
+ */
+
+:root {
+  --bg: #14161a;
+  --panel: #1c1f25;
+  --text: #eceff4;
+  --muted: #9aa4b2;
+  --line: #2b2f37;
+  --accent: #6fb3ff;
+  --danger: #ff6b6b;
+}
+
+/* Light mode is not an afterthought here: a buyer comparing an address
+ * character by character does it in whatever appearance their phone is in, and
+ * grey-on-grey is how a transposed character survives that comparison. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --text: #14161a;
+    --muted: #5a6472;
+    --line: #dfe3e8;
+    --accent: #0b62c4;
+    --danger: #c0392b;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem 1rem 3rem;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+}
+
+main {
+  max-width: 32rem;
+  margin: 0 auto;
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.6rem;
+  letter-spacing: -0.01em;
+}
+
+h2 {
+  margin: 0 0 0.4rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.usd {
+  margin: 0 0 1.5rem;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.qr {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: 0 0 1.5rem;
+}
+
+/* The white plate is part of the symbol, not decoration: the encoder paints a
+ * four-module quiet zone in white onto the canvas, and a dark page background
+ * showing through a canvas that failed to paint would leave a symbol most
+ * readers refuse. */
+#qr {
+  display: block;
+  width: 100%;
+  max-width: 264px;
+  height: auto;
+  background: #ffffff;
+  border-radius: 8px;
+  padding: 0;
+}
+
+.fallback {
+  margin: 0.6rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+.field {
+  margin: 0 0 1.1rem;
+  padding: 0.8rem 0.9rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+/* Monospace with tabular figures, and `word-break: break-all` so a 42-character
+ * address wraps at a character boundary instead of overflowing the viewport on
+ * a phone. An address the buyer has to scroll sideways to read is an address
+ * the buyer does not check. */
+.mono {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums slashed-zero;
+  word-break: break-all;
+  line-height: 1.45;
+}
+
+.selectable {
+  user-select: all;
+  -webkit-user-select: all;
+  cursor: text;
+}
+
+.wrap {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.hint {
+  margin: 0 0 0.5rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.status {
+  margin-top: 1.5rem;
+  padding: 0.9rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+}
+
+#stage-line {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.timer {
+  margin: 0.35rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.notice {
+  margin-top: 3rem;
+  padding: 1.5rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  text-align: center;
+}
+
+.notice.danger {
+  border-color: var(--danger);
+  border-width: 2px;
+}
+
+.notice.danger h1 {
+  color: var(--danger);
+}

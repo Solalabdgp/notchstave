@@ -61,6 +61,7 @@ import datetime as dt
 import hmac
 import os
 import uuid
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 
@@ -137,7 +138,13 @@ class IntegrityKey:
 def load_integrity_key(
     credentials_dir: str | os.PathLike[str] | None = None,
     *,
-    env: dict[str, str] | None = None,
+    # `Mapping`, not `dict`: this function only ever reads from it, and the two
+    # things callers actually have are `os.environ` (a `MutableMapping`, not a
+    # `dict`) and a test's literal. Demanding `dict` forced a copy of the whole
+    # environment at the one call site that passes this, which is how the
+    # argument ended up in the positional slot instead. Matches the sibling
+    # loader `api.telegram.load_webapp_secret`.
+    env: Mapping[str, str] | None = None,
 ) -> IntegrityKey:
     """Read the key from systemd credentials, falling back to the env for dev.
 

@@ -1,0 +1,35 @@
+# Test environment for the api (TZ section 8).
+#
+# A deliberate subset of the root pyproject, same rule as the other four suites:
+# every pin that appears in both files MUST match, and this file is not a second
+# source of truth for versions.
+#
+# `httpx` does not appear in the root pyproject and is not a runtime dependency
+# of this process. It is what `starlette.testclient.TestClient` is built on —
+# the suite drives the real ASGI application through it, so what is exercised is
+# the real middleware stack, the real exception handlers and the real static
+# mount rather than a hand-called route function. A test that called
+# `invoice_page(token, deps)` directly would pass with the security-headers
+# middleware unregistered, which is one of the things under test.
+#
+# There is deliberately no QR library here, in either direction. The server
+# emits the EIP-681 string and the browser draws the symbol (TZ 3.2), so this
+# suite has no image to encode and no image to decode — it pins the string, in
+# the three places the page puts it. A QR encoder or decoder in this file would
+# be tooling for an artifact this process does not produce.
+#
+# aiogram, web3 and celery are deliberately absent: this process imports none of
+# them, and TZ section 8's "никаких сетевых вызовов в CI" is enforced here by
+# the dependency not existing.
+#
+# Versions resolved against the PyPI JSON API on 2026-08-19, not from memory.
+
+fastapi==0.141.1
+psycopg[binary]==3.3.4
+alembic==1.19.1
+prometheus-client==0.26.0
+
+httpx==0.28.1
+
+pytest==9.1.1
+pytest-asyncio==1.4.0

@@ -126,7 +126,20 @@ follow_imports = "skip"
 # keeping a second copy of them. Notchstave's schema is constrained enough that
 # "just insert an invoice" is fifteen statements, and two copies of those would
 # drift from the migrations independently. One run keeps the import honest.
-testpaths = ["settler/tests", "notifier/tests", "core/invoicing/tests", "bot/tests"]
+#
+# api/tests joins for the same reason and imports `core.invoicing.tests
+# .conftest`'s builders in turn. It adds no tool the others do not already need:
+# the page's QR is drawn in the browser (TZ 3.2), so nothing here shells out to
+# a JavaScript runtime — what this suite pins is the EIP-681 *string*, which is
+# the artifact the TZ makes authoritative. See api/static/qr.js on where the
+# line between the two is drawn.
+testpaths = [
+    "settler/tests",
+    "notifier/tests",
+    "core/invoicing/tests",
+    "bot/tests",
+    "api/tests",
+]
 
 # The settler suite talks to a real Postgres over an async engine, so every
 # test in it is a coroutine. `auto` keeps the marker off ~40 test functions
