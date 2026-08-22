@@ -108,6 +108,14 @@ services:
       NOTCHSTAVE_NOTIFIER_DB_PASSWORD: notifier-testpw
       NOTCHSTAVE_BOT_DB_PASSWORD: bot-testpw
       NOTCHSTAVE_API_DB_PASSWORD: api-testpw
+      # TZ 5.8/T1.3. The settler re-checks `integrity_mac` before it credits
+      # anything (settler/service.py::settle_invoice) and refuses to run without
+      # a key, so the suite needs one — and `settler/tests/conftest.py` MACs
+      # every invoice it builds under exactly this value. Listed here rather
+      # than left to the conftest's `setdefault` so that the rig states its own
+      # requirements: a reader of this file should not have to open a conftest
+      # to find out which secrets the tests need.
+      INVOICE_INTEGRITY_KEY: settler-tests-integrity-key-not-a-secret
       REDIS_URL: redis://redis:6379/0
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PYTHONDONTWRITEBYTECODE: "1"

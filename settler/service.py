@@ -81,6 +81,7 @@ Redis that is down and a lock that lies, and ``test_reorg.py`` is the "реор�
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -90,6 +91,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from core.db import enums as E
+from core.invoicing.integrity import IntegrityKey, load_integrity_key, verify_mac
 from settler import metrics
 from settler import repository as repo
 from settler.amounts import raw_to_usd, sum_raw
@@ -195,6 +197,25 @@ _ANOMALY_REVIEW_KIND: dict[str, str] = {
 
 _ACTOR_ID = "settler"
 
+
+@functools.lru_cache(maxsize=1)
+def _process_integrity_key() -> IntegrityKey:
+    """This process's ``INVOICE_INTEGRITY_KEY``, loaded once.
+
+    Cached because :func:`settle_invoice` runs per invoice and per pass, and the
+    loader reads a credential file or the environment every time it is called.
+    The key does not change while the process lives — rotating it means
+    restarting the units that hold it, since every invoice already issued is
+    MAC'd under the old one (see :func:`core.invoicing.integrity
+    .load_integrity_key`).
+
+    Raises when neither source is present, which is the correct start-up
+    failure: a settler that cannot check the MAC must not credit money, and the
+    alternative — treating "no key" as "check disabled" — is exactly the
+    silently-skipped countermeasure this function exists to end.
+    """
+    return load_integrity_key()
+
 #: Scale of ``users.internal_balance_usd`` — ``NUMERIC(18, 6)`` from migration
 #: 0001. Named here because the rounding direction below is a money decision, not
 #: a formatting detail.
@@ -278,6 +299,7 @@ async def settle_invoice(
     *,
     policy: MoneyPolicy = DEFAULT_POLICY,
     actor_id: str = _ACTOR_ID,
+    integrity_key: IntegrityKey | None = None,
 ) -> SettlementResult:
     """Decide and apply the state of one invoice. Idempotent by construction.
 
@@ -290,16 +312,27 @@ async def settle_invoice(
     1. ``SELECT ... FOR UPDATE`` the invoice. Everything after this point is
        serialised per invoice (T2.3). The row also carries the chain's
        confirmation policy and the asset's decimals, read in the same snapshot.
-    2. Open a manual review for every anomalous payment on the invoice. These
+    2. **Verify ``integrity_mac`` before anything else looks at the amount**
+       (TZ 5.8/T1.3). See :func:`_refuse_tampered_invoice` for what a failure
+       does and why nothing below it may run first.
+    3. Open a manual review for every anomalous payment on the invoice. These
        are *payment-level* problems: a stray USDT transfer does not stop a
        correct USDC payment from settling, it just needs its own human. The
        anomalous amounts are not in the SUM either way.
-    3. Work out the confirmation regime from the money at stake (TZ 5.4) and
+    4. Work out the confirmation regime from the money at stake (TZ 5.4) and
        turn it into a single creditable height.
-    4. Recompute the settled total as a ``SUM`` (TZ 5.3) and classify it against
+    5. Recompute the settled total as a ``SUM`` (TZ 5.3) and classify it against
        the TZ 5.5 table.
-    5. Apply — with CAS, and with the grant guarded by the partial unique index.
+    6. Apply — with CAS, and with the grant guarded by the partial unique index.
+
+    ``integrity_key`` defaults to this process's key
+    (:func:`_process_integrity_key`). ``None`` is *not* "skip the check": there
+    is no argument, no flag and no environment variable that turns step 2 off,
+    which is the whole point of the change that introduced it. A settler without
+    a key fails to start.
     """
+    key = _process_integrity_key() if integrity_key is None else integrity_key
+
     ctx = await repo.lock_invoice(conn, invoice_id)
     if ctx is None:
         raise InvoiceNotFound(str(invoice_id))
@@ -307,6 +340,20 @@ async def settle_invoice(
         raise InconsistentInvoice(
             f"invoice {invoice_id}: asset {ctx.asset_id} belongs to chain "
             f"{ctx.asset_chain_id}, invoice claims {ctx.chain_id}"
+        )
+
+    if not verify_mac(
+        key,
+        ctx.integrity_mac,
+        invoice_id=ctx.invoice_id,
+        chain_id=ctx.chain_id,
+        asset_id=ctx.asset_id,
+        address=ctx.address,
+        amount_due_raw=ctx.amount_due_raw,
+        expires_at=ctx.expires_at,
+    ):
+        return await _refuse_tampered_invoice(
+            conn, ctx=ctx, policy=policy, actor_id=actor_id
         )
 
     if ctx.status in SETTLED_INVOICE_STATUSES:
@@ -443,6 +490,114 @@ async def settle_invoice(
         decision=decision,
         manual_review_ids=review_ids,
         confirmation_rule=rule,
+    )
+
+
+async def _refuse_tampered_invoice(
+    conn: AsyncConnection,
+    *,
+    ctx: repo.InvoiceContext,
+    policy: MoneyPolicy,
+    actor_id: str,
+) -> SettlementResult:
+    """``integrity_mac`` did not verify. Credit nothing, call a human, alarm.
+
+    TZ 5.8/T1.3 puts a MAC over ``(invoice_id, chain_id, asset_id, address,
+    amount_due_raw, expires_at)`` under a key that is not in the database, and
+    names three places it must be re-checked. Two of them — the bot before it
+    shows an address, the api before it renders the page — were built in Week 5.
+    This is the third, and it is the one that stops the attack the other two
+    cannot see: an attacker with write access to the database but not to
+    ``INVOICE_INTEGRITY_KEY`` sets ``amount_due_raw = 1``, sends one base unit
+    from a wallet the buyer-facing checks never touch, and is granted the
+    product. Neither the bot nor the api is in that flow at all — the settler is
+    the only process that reads the amount when deciding whether the bill was
+    paid, so the settler is the only place that check can happen.
+
+    What this does, and why each part:
+
+    * **Nothing is credited and no status is promoted to a paid one.** The
+      amount that would decide the question is one of the fields that failed to
+      authenticate, so there is no honest decision available.
+    * **A live invoice is moved to ``manual_review``** with the usual CAS. That
+      is what takes it out of ``LIVE_INVOICE_STATUSES`` and therefore out of
+      :data:`settler.main.SQL_SETTLE_CANDIDATES` — without it the settler would
+      re-read, re-fail and re-alert this invoice on every pass forever. An
+      invoice already in a terminal state keeps it: the case and the audit row
+      still get written, because "somebody edited a settled invoice" is exactly
+      as serious and rather more interesting.
+    * **``notchstave_invoice_mac_failures_total`` moves.** TZ section 7 alerts
+      on ``> 0`` with no rate and no threshold, because there is no benign
+      reading of this number.
+    * **An ``audit_log`` row**, so the event survives even if the manual review
+      is closed later. The audit trail is append-only for the settler role
+      (0002/0003), which is the property that makes it worth writing here.
+
+    The invoice is deliberately *not* cancelled and the entitlement of an
+    earlier, legitimate settlement is deliberately not revoked. Both would be
+    money decisions taken on the strength of a row that has just been shown to
+    be untrustworthy; the correct next actor is a human with a database console,
+    which is precisely what ``manual_review`` summons.
+    """
+    metrics.MAC_FAILURES.inc()
+
+    note = (
+        f"integrity_mac does not verify over (id, chain_id, asset_id, address, "
+        f"amount_due_raw, expires_at) for invoice {ctx.invoice_id} (TZ 5.8/T1.3). "
+        f"The row was changed outside the application — suspected database "
+        f"compromise. Nothing was credited. Do not resolve this case by crediting "
+        f"until the stored amount and address have been checked against the "
+        f"buyer's payment page and the audit trail."
+    )
+    review_id = await repo.open_manual_review(
+        conn,
+        kind=str(E.ManualReviewKind.MAC_FAILURE),
+        invoice_id=ctx.invoice_id,
+        payment_id=None,
+        note=note,
+        policy_version=policy.version,
+    )
+
+    moved = False
+    if ctx.status in LIVE_INVOICE_STATUSES:
+        moved = await repo.cas_invoice_status(
+            conn,
+            ctx.invoice_id,
+            new_status=str(E.InvoiceStatus.MANUAL_REVIEW),
+            expected=LIVE_INVOICE_STATUSES,
+        )
+
+    await repo.write_audit(
+        conn,
+        actor_id=actor_id,
+        action="settle.integrity_mac_failed",
+        target_kind="invoice",
+        target_id=str(ctx.invoice_id),
+        before_state={"status": ctx.status},
+        after_state={"status": str(E.InvoiceStatus.MANUAL_REVIEW) if moved else ctx.status},
+        args={
+            # The tuple that was checked, not the MAC itself: an operator
+            # reading this row needs to know which values were authenticated so
+            # they can compare them against what the buyer was shown. The stored
+            # MAC is 32 bytes of no diagnostic use and is left where it is.
+            "chain_id": ctx.chain_id,
+            "asset_id": ctx.asset_id,
+            "address": ctx.address,
+            "amount_due_raw": str(ctx.amount_due_raw),
+            "expires_at": ctx.expires_at.isoformat(),
+            "credited": False,
+            "moved_to_manual_review": moved,
+        },
+        policy_version=policy.version,
+    )
+
+    metrics.INVOICES_SETTLED.labels(outcome=str(Outcome.INTEGRITY_FAILED)).inc()
+
+    return SettlementResult(
+        ctx.invoice_id,
+        Outcome.INTEGRITY_FAILED,
+        manual_review_ids=() if review_id is None else (review_id,),
+        pending_reason="integrity_mac does not verify (TZ 5.8/T1.3)",
     )
 
 
@@ -1306,6 +1461,7 @@ class Settler:
         policy: MoneyPolicy = DEFAULT_POLICY,
         lock: InvoiceLock | None = None,
         actor_id: str = _ACTOR_ID,
+        integrity_key: IntegrityKey | None = None,
     ) -> None:
         self._engine = engine
         self._policy = policy
@@ -1313,6 +1469,14 @@ class Settler:
         #: must be correct without it (TZ 5.8/T2.4).
         self._lock: InvoiceLock = lock or NullLock()
         self._actor_id = actor_id
+        #: Resolved here rather than per settlement so that a missing
+        #: ``INVOICE_INTEGRITY_KEY`` is a start-up failure in
+        #: :func:`settler.main.main` and not a surprise on the first invoice
+        #: that carries money. There is no configuration under which this stays
+        #: ``None`` and the T1.3 check is skipped.
+        self._integrity_key = (
+            _process_integrity_key() if integrity_key is None else integrity_key
+        )
 
     @property
     def policy(self) -> MoneyPolicy:
@@ -1326,7 +1490,11 @@ class Settler:
                 return SettlementResult(invoice_id, Outcome.SKIPPED_BUSY)
             async with self._engine.begin() as conn:
                 return await settle_invoice(
-                    conn, invoice_id, policy=self._policy, actor_id=self._actor_id
+                    conn,
+                    invoice_id,
+                    policy=self._policy,
+                    actor_id=self._actor_id,
+                    integrity_key=self._integrity_key,
                 )
 
     async def handle_reorg(self, chain_id: int) -> ReorgResult:

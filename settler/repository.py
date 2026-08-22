@@ -122,6 +122,12 @@ class InvoiceContext:
     topup_window_until: dt.datetime
     settled_at: dt.datetime | None
     policy_version: str
+    #: TZ 5.8/T1.3. Read under the same lock as the amount it authenticates,
+    #: because a MAC checked against a second read of the row proves only that
+    #: the row was consistent at some point, not that it is the row the decision
+    #: was taken on. :func:`settler.service.settle_invoice` verifies it before
+    #: any money is credited.
+    integrity_mac: bytes
     address: str
     asset_decimals: int
     asset_symbol: str
@@ -205,6 +211,7 @@ SQL_LOCK_INVOICE = sa.text(
            i.amount_due_raw, i.amount_due_usd, i.rate_snapshot,
            i.status::text        AS status,
            i.expires_at, i.topup_window_until, i.settled_at, i.policy_version,
+           i.integrity_mac       AS integrity_mac,
            ra.address            AS address,
            a.decimals            AS asset_decimals,
            a.symbol              AS asset_symbol,
@@ -305,6 +312,7 @@ async def lock_invoice(conn: AsyncConnection, invoice_id: uuid.UUID) -> InvoiceC
         topup_window_until=row["topup_window_until"],
         settled_at=row["settled_at"],
         policy_version=row["policy_version"],
+        integrity_mac=bytes(row["integrity_mac"]),
         address=row["address"],
         asset_decimals=int(row["asset_decimals"]),
         asset_symbol=row["asset_symbol"],

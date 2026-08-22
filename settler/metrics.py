@@ -33,6 +33,7 @@ __all__ = [
     "DOUBLE_GRANT_BLOCKED",
     "ORPHAN_PAYMENTS",
     "UNASSIGNED_PAYMENTS",
+    "MAC_FAILURES",
     "MANUAL_REVIEW_OPEN",
     "PAYMENT_CREDIT_SECONDS",
     "RECONCILE_DRIFT_USD",
@@ -68,6 +69,14 @@ DOUBLE_GRANT_BLOCKED = Counter(
 ORPHAN_PAYMENTS = core_metrics.orphan_payments_total
 
 UNASSIGNED_PAYMENTS = core_metrics.unassigned_payments_total
+
+#: TZ 5.8/T1.3 names three observation points for this counter — "перед
+#: отправкой сообщения с адресом, при рендере страницы инвойса, **при зачёте в
+#: settler**". The bot and the api reached it through
+#: :mod:`core.invoicing.metrics`; this alias is the third one, and until it
+#: existed the settlement checkpoint the TZ asks for was not implemented at all.
+#: Same family, one declaration site, three callers.
+MAC_FAILURES = core_metrics.invoice_mac_failures_total
 
 MANUAL_REVIEW_OPEN = Gauge(
     "notchstave_manual_review_open",

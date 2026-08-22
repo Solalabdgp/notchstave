@@ -31,6 +31,13 @@ called on demand, because each of them is a decision a human takes rather than a
 state the database drifts into. `/reconcile` is the one that will eventually
 want a schedule; see the TODO at the end of :mod:`settler.admin.reconcile`.
 
+**This process needs ``INVOICE_INTEGRITY_KEY``** and refuses to start without
+it. TZ 5.8/T1.3 names the settler as one of the three re-check points for
+``integrity_mac`` ("при зачёте в settler"), and :func:`settler.service
+.settle_invoice` verifies it under the same row lock the money decision is taken
+on. `.env.example` already scoped the key to settler/api/bot; until Week 5 the
+settler was the one of those three that never read it.
+
 Not wired here (deliberately, with owners named):
 
 * `/healthz` — TZ section 7 puts it on the api process, and unlike the point
@@ -67,6 +74,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from core.db.roles import process_database_url
+from core.invoicing.integrity import load_integrity_key
 from settler import metrics
 from settler.locks import InvoiceLock, NullLock
 from settler.policy import MoneyPolicy
@@ -192,8 +200,20 @@ async def main() -> None:
     except OSError:
         log.exception("could not start /metrics on port %d", metrics_port)
 
+    # Before the engine and before the first pass: TZ 5.8/T1.3 makes the settler
+    # one of the three processes that re-check `integrity_mac`, and a settler
+    # that cannot check it must not start rather than credit money unchecked.
+    # `load_integrity_key` raises with the credential name and the env var when
+    # neither is present.
+    integrity_key = load_integrity_key()
+
     engine = build_engine()
-    settler = Settler(engine, policy=MoneyPolicy.from_env(), lock=build_lock())
+    settler = Settler(
+        engine,
+        policy=MoneyPolicy.from_env(),
+        lock=build_lock(),
+        integrity_key=integrity_key,
+    )
 
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()

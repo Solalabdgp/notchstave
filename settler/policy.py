@@ -94,6 +94,13 @@ class Outcome(enum.StrEnum):
     #: (cancelled, expired, reverted, already in manual review).
     NOT_LIVE = "not_live"
 
+    #: ``integrity_mac`` did not verify (TZ 5.8/T1.3). Not a money decision and
+    #: deliberately not one of the states above: nothing about the amount was
+    #: decided, because the amount is one of the fields that failed to
+    #: authenticate. The invoice is taken out of the live set and a human is
+    #: called; see :func:`settler.service.settle_invoice`.
+    INTEGRITY_FAILED = "integrity_failed"
+
 
 #: Outcomes after which the invoice is closed and the product is owed.
 SETTLED_OUTCOMES = frozenset(

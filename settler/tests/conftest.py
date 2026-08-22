@@ -46,6 +46,27 @@ from core.db import enums as E  # noqa: E402
 
 DEFAULT_URL = "postgresql+psycopg://notchstave:testpw@localhost:55432/notchstave_test"
 
+#: The key every invoice built here is MAC'd under (TZ 5.8/T1.3).
+#:
+#: Set into the environment at import time, before anything reads it, because
+#: :func:`settler.service.settle_invoice` loads the process key through
+#: :func:`core.invoicing.integrity.load_integrity_key` and a settler that cannot
+#: find one refuses to run — which is the correct production behaviour and would
+#: otherwise make this whole suite depend on a shell variable.
+#:
+#: The important half is the *other* one: :meth:`World.invoice` computes a real
+#: MAC over the row it writes. Until Week 5 it wrote ``ab`` repeated 32 times,
+#: which satisfied the ``octet_length = 32`` CHECK and nothing else — so a test
+#: could not have caught a settler that never verified the MAC, because every
+#: invoice in the suite carried one that could not verify. A fixture that makes
+#: the check unfalsifiable is worse than no fixture.
+TEST_INTEGRITY_KEY_MATERIAL = "settler-tests-integrity-key-not-a-secret"
+os.environ.setdefault("INVOICE_INTEGRITY_KEY", TEST_INTEGRITY_KEY_MATERIAL)
+
+from core.invoicing.integrity import IntegrityKey, compute_mac  # noqa: E402
+
+TEST_INTEGRITY_KEY = IntegrityKey(os.environ["INVOICE_INTEGRITY_KEY"])
+
 #: Tables holding test data, in no particular order — ``CASCADE`` sorts out the
 #: foreign keys, and ``RESTART IDENTITY`` means an assertion can say "entitlement
 #: 1" without depending on how many tests ran before it.
@@ -462,6 +483,27 @@ class World:
         created_at = dt.datetime.now(dt.UTC) - age
         expires_at = created_at + expires_in
         rate_locked_until = expires_at if rate_lock is None else created_at + rate_lock
+        # The address is read back rather than passed in because the MAC is
+        # taken over the string in `receive_addresses.address` exactly as
+        # stored, EIP-55 case included (core/invoicing/integrity.py). A caller
+        # that had to supply it separately could supply a different one, and the
+        # resulting invoice would fail its own MAC for a reason that has nothing
+        # to do with the property under test.
+        address = (
+            await self._conn.execute(
+                sa.text("SELECT address FROM receive_addresses WHERE id = :id"),
+                {"id": address_id},
+            )
+        ).scalar_one()
+        integrity_mac = compute_mac(
+            TEST_INTEGRITY_KEY,
+            invoice_id=invoice_id,
+            chain_id=chain_id,
+            asset_id=asset_id,
+            address=address,
+            amount_due_raw=Decimal(amount_due_raw),
+            expires_at=expires_at,
+        )
         await self._conn.execute(
             sa.text(
                 """
@@ -492,7 +534,7 @@ class World:
                 "expires_at": expires_at,
                 "topup_window_until": expires_at + topup_window,
                 "created_at": created_at,
-                "mac": "ab" * 32,
+                "mac": integrity_mac.hex(),
                 "public_token": uuid.uuid4().hex,
                 "policy_version": policy_version,
             },
