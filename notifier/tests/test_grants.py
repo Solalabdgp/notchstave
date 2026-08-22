@@ -26,8 +26,12 @@ these grants. Three matter most:
   Migration 0004 narrows it to one column, and the parametrised cases below are
   what stop it being widened back.
 
-``SET LOCAL ROLE`` rather than six logins: the roles are ``NOLOGIN`` on purpose,
-and a test needing passwords for all of them is a test nobody runs.
+``SET LOCAL ROLE`` on the owner's connection: this file checks what
+``notchstave_notifier`` may do, not what the notifier process does. The second
+question — does the process actually arrive as that role — went unasked until
+``settler/tests/test_login_roles.py``, and the answer for weeks 1-5 was no: every
+process connected as the table owner, which is denied nothing. Both files are
+kept; this one needs no credentials and goes deeper on the matrix itself.
 """
 
 from __future__ import annotations

@@ -15,9 +15,18 @@ So this file does two things:
   specific holes (the settler used to hold UPDATE on ``receive_addresses``), and
   a test is what stops them being reopened by a future edit to the GRANTS dict.
 
-``SET ROLE`` rather than a second connection with its own login: the roles are
-created ``NOLOGIN`` on purpose, and a test that needed passwords for six roles
-would be a test nobody runs.
+``SET ROLE`` on the owner's connection, which is a deliberate choice and a
+limited one. It proves what ``notchstave_settler`` is *allowed* to do; it cannot
+prove that the settler process ever assumes it, and for weeks 1-5 it did not —
+every process connected as the table owner, so none of these REVOKEs was ever
+evaluated in production. That half is now covered by
+``settler/tests/test_login_roles.py``, which connects as
+``notchstave_settler_login`` with a password and never calls ``SET ROLE``.
+
+This file stays because the two are complementary, not redundant: ``SET ROLE``
+needs no credentials, so it runs on any developer's database, and the sufficiency
+half below (a whole settlement, a whole admin resolution, under the role) is far
+more thorough than anything a connection-level test would be worth writing twice.
 """
 
 from __future__ import annotations

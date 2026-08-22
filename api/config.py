@@ -21,9 +21,19 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from core.db.roles import process_database_url
+from core.db.roles import psycopg_dsn as _psycopg_dsn
+
 __all__ = ["ApiConfig"]
 
-DEFAULT_DATABASE_URL = "postgresql+psycopg://notchstave:change-me-local-dev-only@localhost:5432/notchstave"
+#: No default connection URL exists on purpose. The api is the one process on a
+#: public interface, and the previous default pointed at the *schema owner* — so
+#: a deployment that forgot to configure it did not fail, it silently ran the
+#: internet-facing process with full table-owner rights, which is exactly the
+#: hole the per-process login roles close. :meth:`ApiConfig.from_env` now reads
+#: ``API_DATABASE_URL`` through :func:`core.db.roles.process_database_url` and
+#: raises when it is absent. Tests construct :class:`ApiConfig` directly.
+
 #: How often the invoice page re-asks for status. Two seconds is well inside the
 #: block time of every chain in TZ 2, so the page never shows a confirmation
 #: count that the watcher has already moved past for longer than one tick.
@@ -52,10 +62,12 @@ def _int(src: Mapping[str, str], name: str, default: int) -> int:
 class ApiConfig:
     """Non-secret knobs for the invoice page and its status endpoint."""
 
-    #: SQLAlchemy-form URL, as everywhere else in this repo. Converted to a
-    #: libpq DSN at the point of connection, not here — one variable for the
-    #: whole project rather than a second that can drift out of sync.
-    database_url: str = DEFAULT_DATABASE_URL
+    #: SQLAlchemy-form URL for ``notchstave_api_login``, the role this process
+    #: authenticates as. Converted to a libpq DSN at the point of connection, not
+    #: here — one variable per process rather than a second that can drift out of
+    #: sync with the first. Required, with no default: see the note above
+    #: :data:`DEFAULT_STATUS_POLL_SECONDS`.
+    database_url: str
 
     #: Seconds between the page's status polls. Sent to the browser rather than
     #: hard-coded in the script, so an operator can slow it down under load
@@ -75,13 +87,13 @@ class ApiConfig:
         module it calls is synchronous psycopg for the reasons its own docstring
         gives.
         """
-        return self.database_url.replace("postgresql+psycopg://", "postgresql://", 1)
+        return _psycopg_dsn(self.database_url)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> ApiConfig:
         src = os.environ if env is None else env
         return cls(
-            database_url=src.get("DATABASE_URL", DEFAULT_DATABASE_URL),
+            database_url=process_database_url("api", env=src),
             status_poll_seconds=_float(
                 src, "API_STATUS_POLL_SECONDS", DEFAULT_STATUS_POLL_SECONDS
             ),

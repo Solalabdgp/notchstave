@@ -180,7 +180,14 @@ class WatcherSettings:
                 return fallback
 
         return cls(
-            database_url=source.get("DATABASE_URL", ""),
+            # WATCHER_DATABASE_URL, not the repo-wide DATABASE_URL: this process
+            # connects as `notchstave_watcher_login` so that the one privilege it
+            # actually needs to be denied — writing `receive_addresses` (TZ
+            # 5.8/T1.2) — is denied by PostgreSQL and not merely by convention.
+            # Empty rather than raising, because `bot.main` builds a
+            # WatcherSettings purely to reach `build_pool` and never opens the
+            # connection; `watcher.main.run` is what refuses to start without it.
+            database_url=source.get("WATCHER_DATABASE_URL", ""),
             metrics_port=int(number("WATCHER_METRICS_PORT", 9102)),
             poll_interval_seconds=number("WATCHER_POLL_INTERVAL_SECONDS", 3.0),
             chunks=ChunkPolicy(

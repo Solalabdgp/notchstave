@@ -41,6 +41,7 @@ import signal
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING, Any
 
@@ -132,19 +133,56 @@ def build_deriver(credentials_dir: str | None = None) -> Deriver:
     return deriver
 
 
-def database_dsn(url: str | None = None) -> str:
-    """``DATABASE_URL`` as a libpq connection string.
+#: Where systemd drops this process's connection URL. The URL carries a password,
+#: so in production it is a credential file and not an environment variable —
+#: same rule and same precedence as the xpub and the integrity key, and for the
+#: same reason (an env var is readable from `docker inspect`, `/proc/<pid>/environ`
+#: and a core dump).
+DATABASE_URL_CREDENTIAL = "notchstave-deriver-database-url"
 
-    The repo standardises on SQLAlchemy's ``postgresql+psycopg://`` form
-    (``.env.example``, ``alembic.ini``, ``migrations/env.py``) and psycopg does
-    not understand the ``+driver`` suffix. Stripped here rather than solved with
-    a second environment variable, which would be a second thing to keep in sync
-    with the first. Duplicated from ``core.invoicing.tests.conftest`` on purpose:
-    four lines copied is the price of not importing ``core`` from this package.
+
+def database_dsn(url: str | None = None, *, credentials_dir: str | None = None) -> str:
+    """``DERIVER_DATABASE_URL`` as a libpq connection string.
+
+    **Not the repo-wide ``DATABASE_URL``.** That variable is the schema *owner*,
+    and a table owner is never denied anything on its own tables — so while every
+    process used it, the grant matrix of migrations 0002/0006/0007/0008 was never
+    evaluated by PostgreSQL at all. This process connects as
+    ``notchstave_deriver_login``, a member of ``notchstave_deriver``: the one role
+    that may write ``receive_addresses`` (TZ 5.8/T1.2), mint an invoice (0006) and
+    answer a request queue (0007/0008). Those are privileges worth holding
+    *because* the other five roles provably do not hold them.
+
+    Credential file first, environment second, nothing third. There is no
+    fallback to a shared URL: a deriver that cannot find its own credentials must
+    fail to start rather than quietly acquire more authority than it is supposed
+    to have.
+
+    The ``+driver`` suffix is stripped here because the repo standardises on
+    SQLAlchemy's ``postgresql+psycopg://`` form (``.env.example``, ``alembic.ini``,
+    ``migrations/env.py``) and psycopg does not understand it. Duplicated from
+    :mod:`core.db.roles` on purpose: a dozen lines copied is the price of not
+    importing ``core`` from this package, which ``deriver/pyproject.toml`` and
+    ``deriver/tests/test_isolation.py`` exist to prevent.
     """
-    raw = url or os.environ.get("DATABASE_URL")
+    raw = url
+    if raw is None:
+        raw_dir = credentials_dir or os.environ.get("CREDENTIALS_DIRECTORY")
+        if raw_dir:
+            candidate = Path(raw_dir) / DATABASE_URL_CREDENTIAL
+            if candidate.is_file():
+                raw = candidate.read_text(encoding="utf-8").rstrip("\r\n") or None
+    if raw is None:
+        raw = os.environ.get("DERIVER_DATABASE_URL")
     if not raw:
-        raise RuntimeError("DATABASE_URL is not set")
+        raise RuntimeError(
+            "DERIVER_DATABASE_URL is not set. The deriver connects as its own "
+            "PostgreSQL login role (notchstave_deriver_login, a member of "
+            "notchstave_deriver) so that migration 0002's grant matrix is "
+            "enforced by the database and not merely documented by it. There is "
+            "no fallback to DATABASE_URL: that is the schema owner. Production "
+            f"delivers this as the systemd credential {DATABASE_URL_CREDENTIAL}."
+        )
     return raw.replace("postgresql+psycopg://", "postgresql://", 1)
 
 

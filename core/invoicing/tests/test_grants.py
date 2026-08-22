@@ -18,9 +18,13 @@ So this file does the two halves that matter, the same way
   closed to everyone but the deriver, and 0006's own argument is the reason
   minting an invoice is now in the same place.
 
-``SET ROLE`` rather than six logins: the roles are created ``NOLOGIN`` on
-purpose, and a test that needed passwords for six roles would be a test nobody
-runs.
+``SET ROLE`` on the owner's connection. That proves what ``notchstave_deriver``
+is *allowed* to do and cannot prove that the issuer process assumes it — which
+for weeks 1-5 it did not, because every process connected as the table owner.
+The connection-level half is ``settler/tests/test_login_roles.py`` (all six
+roles, real passwords, no ``SET ROLE`` anywhere). Both are kept: this one needs
+no credentials and covers a complete `/buy` under the role, which is the depth
+that catches a missing GRANT before a deploy does.
 """
 
 from __future__ import annotations

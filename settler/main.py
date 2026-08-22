@@ -66,6 +66,7 @@ from contextlib import suppress
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from core.db.roles import process_database_url
 from settler import metrics
 from settler.locks import InvoiceLock, NullLock
 from settler.policy import MoneyPolicy
@@ -94,18 +95,23 @@ SQL_ENABLED_CHAINS = sa.text("SELECT chain_id FROM chains WHERE is_enabled ORDER
 
 
 def _database_url() -> str:
-    """The repo-wide ``DATABASE_URL``, used as-is.
+    """``SETTLER_DATABASE_URL`` — this process's own login, not the owner's.
 
-    No rewriting is needed and none is done: ``postgresql+psycopg://`` is the
+    Not the repo-wide ``DATABASE_URL``, which is the schema owner and is now
+    reserved for Alembic and the role-provisioning step. The settler connects as
+    ``notchstave_settler_login``, a member of ``notchstave_settler``, so that the
+    grant matrix in migrations 0002/0003/0006 is enforced by PostgreSQL rather
+    than described by it — an owner connection is never denied anything on its
+    own tables, which made every "the settler cannot do X" claim in TZ 5.8
+    unenforced. :mod:`core.db.roles` holds the lookup and the argument.
+
+    No URL rewriting is needed and none is done: ``postgresql+psycopg://`` is the
     same URL for both modes, because psycopg 3 is one driver with a sync and an
     async face and SQLAlchemy picks the async one when the engine is async. A
     second driver (asyncpg) would mean a second set of type adapters for
     ``NUMERIC(78,0)`` in the one place where numeric behaviour is the product.
     """
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL is not set")
-    return url
+    return process_database_url("settler")
 
 
 def build_engine(url: str | None = None) -> AsyncEngine:

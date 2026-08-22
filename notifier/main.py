@@ -40,6 +40,7 @@ from contextlib import suppress
 
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from core.db.roles import process_database_url
 from notifier.config import NotifierConfig
 from notifier.ratelimit import LocalRateLimiter, RateLimiter, RedisRateLimiter
 from notifier.sender import DryRunSender, MessageSender
@@ -51,10 +52,16 @@ __all__ = ["build_engine", "build_rate_limiter", "build_sender", "main"]
 
 
 def _database_url() -> str:
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL is not set")
-    return url
+    """``NOTIFIER_DATABASE_URL`` — this process's own login, not the owner's.
+
+    The notifier connects as ``notchstave_notifier_login`` (a member of
+    ``notchstave_notifier``), whose grants are: UPDATE on ``notifications``,
+    SELECT on what a message renders from, INSERT on ``audit_log``, and no write
+    anywhere near money. Under the previous shared ``DATABASE_URL`` — the schema
+    owner — none of that was enforced, because an owner is never denied anything
+    on its own tables. See :mod:`core.db.roles`.
+    """
+    return process_database_url("notifier")
 
 
 def build_engine(url: str | None = None) -> AsyncEngine:

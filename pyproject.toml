@@ -133,7 +133,16 @@ follow_imports = "skip"
 # a JavaScript runtime — what this suite pins is the EIP-681 *string*, which is
 # the artifact the TZ makes authoritative. See api/static/qr.js on where the
 # line between the two is drawn.
+#
+# tests/db joins them without needing any of that: it is the pure-lookup half of
+# the per-process-login work (which URL a process picks up, and which it refuses
+# to), and it runs from a bare checkout with no database at all. It is here
+# rather than left to a separate `pytest tests/` because its subject — that no
+# process falls back to the owner's DATABASE_URL — is the one property whose
+# regression is invisible in every other suite: everything else would keep
+# passing, since the fixtures connect as the owner by design.
 testpaths = [
+    "tests/db",
     "settler/tests",
     "notifier/tests",
     "core/invoicing/tests",

@@ -146,7 +146,15 @@ async def run(chain_id: int, settings: WatcherSettings) -> int:
     from watcher.store.postgres import PostgresWatcherStore
 
     if not settings.database_url:
-        logger.error("DATABASE_URL is not set")
+        # Not DATABASE_URL: that one is the schema owner and belongs to Alembic.
+        # The watcher connects as `notchstave_watcher_login`, a member of
+        # `notchstave_watcher`, and there is deliberately no fallback — see
+        # `core/db/roles.py` for why an owner fallback is the bug rather than the
+        # convenience.
+        logger.error(
+            "WATCHER_DATABASE_URL is not set: the watcher connects as its own "
+            "PostgreSQL login role (notchstave_watcher_login). See .env.example."
+        )
         return 2
 
     store: WatcherStore = PostgresWatcherStore.from_dsn(settings.database_url)

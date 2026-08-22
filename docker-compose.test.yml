@@ -92,8 +92,22 @@ services:
         condition: service_healthy
     environment:
       # psycopg 3 is one driver with a sync and an async face; SQLAlchemy picks
-      # the async one for an async engine. Same URL for Alembic and for tests.
+      # the async one for an async engine. This is the OWNER connection: Alembic
+      # needs it, and so does every fixture that builds a world or truncates
+      # between tests. The per-process login roles below are what the *processes*
+      # use, and what settler/tests/test_login_roles.py connects with.
       DATABASE_URL: postgresql+psycopg://notchstave:testpw@postgres:5432/notchstave_test
+      # Deterministic, in the file, and correct to be so: this rig must run on a
+      # clean checkout with no .env, because "the tests need a secret" is how a
+      # test suite stops being run. These are not production credentials and the
+      # database they belong to is a tmpfs that does not survive the run.
+      # `python -m core.db.roles` (below) reads exactly these names.
+      NOTCHSTAVE_DERIVER_DB_PASSWORD: deriver-testpw
+      NOTCHSTAVE_WATCHER_DB_PASSWORD: watcher-testpw
+      NOTCHSTAVE_SETTLER_DB_PASSWORD: settler-testpw
+      NOTCHSTAVE_NOTIFIER_DB_PASSWORD: notifier-testpw
+      NOTCHSTAVE_BOT_DB_PASSWORD: bot-testpw
+      NOTCHSTAVE_API_DB_PASSWORD: api-testpw
       REDIS_URL: redis://redis:6379/0
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PYTHONDONTWRITEBYTECODE: "1"
@@ -111,7 +125,13 @@ services:
                        -r bot/tests/requirements.txt \
                        -r api/tests/requirements.txt
         alembic upgrade head
-        pytest settler/tests notifier/tests core/invoicing/tests bot/tests api/tests -v
+        # Migration 0009 creates the six LOGIN roles with PASSWORD NULL — they
+        # exist and cannot authenticate until this runs. Deliberate: a migration
+        # that shipped a default password would ship it to every clone. Without
+        # this line settler/tests/test_login_roles.py skips, which would make the
+        # one suite that actually proves the grant matrix silently optional.
+        python -m core.db.roles
+        pytest tests/db settler/tests notifier/tests core/invoicing/tests bot/tests api/tests -v
 
 volumes:
   notchstave_test_pipcache:

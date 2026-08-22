@@ -48,6 +48,8 @@ from bot.config import BotConfig
 from bot.handlers import build_router
 from bot.repository import BotRepository
 from bot.services import BotServices
+from core.db.roles import process_database_url
+from core.db.roles import psycopg_dsn as roles_psycopg_dsn
 from core.invoicing.client import InvoiceClient
 from core.invoicing.integrity import load_integrity_key
 from core.invoicing.proof import ProofClient
@@ -61,10 +63,17 @@ __all__ = ["build_engine", "psycopg_dsn", "build_services", "build_dispatcher", 
 
 
 def _database_url() -> str:
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL is not set")
-    return url
+    """``BOT_DATABASE_URL`` — this process's own login, not the owner's.
+
+    The bot connects as ``notchstave_bot_login`` (a member of
+    ``notchstave_bot``). That role may INSERT a row in ``invoice_requests`` and
+    may not answer one (0007), may not mint an invoice (0006) and may not write
+    ``receive_addresses`` at all (0002/T1.2) — which is the entire reason `/buy`
+    is a queue rather than a function call. None of it was enforced while this
+    process connected with the repo-wide ``DATABASE_URL``, i.e. as the user that
+    owns the tables. See :mod:`core.db.roles`.
+    """
+    return process_database_url("bot")
 
 
 def build_engine(url: str | None = None) -> AsyncEngine:
@@ -72,7 +81,7 @@ def build_engine(url: str | None = None) -> AsyncEngine:
 
 
 def psycopg_dsn(url: str | None = None) -> str:
-    """``DATABASE_URL`` as a libpq connection string.
+    """The bot's own URL as a libpq connection string.
 
     The repo standardises on SQLAlchemy's ``postgresql+psycopg://`` form and
     psycopg does not understand the ``+driver`` suffix. The two invoicing
@@ -81,7 +90,7 @@ def psycopg_dsn(url: str | None = None) -> str:
     the same URL rather than a second environment variable that can drift from
     the first.
     """
-    return (url or _database_url()).replace("postgresql+psycopg://", "postgresql://", 1)
+    return roles_psycopg_dsn(url or _database_url())
 
 
 async def build_balance_source(engine: AsyncEngine, chain_id: int) -> BalanceSource | None:
@@ -141,6 +150,19 @@ async def build_services(engine: AsyncEngine, config: BotConfig) -> BotServices:
         # requiring a manual INSERT means the admin notifications of TZ 5.8/T7
         # have somewhere to go from the first start.
         owner = await repo.upsert_user(config.owner_tg_id)
+        # TODO(C1 follow-up): `engine` is the *bot's* engine, so since the
+        # per-process login roles went in, every AdminOps write runs as
+        # `notchstave_bot_login`. The docstrings in `settler/admin/` say the
+        # settler executes owner money decisions under its own role, and the
+        # grant matrix agrees — `notchstave_bot` has no INSERT on `entitlements`
+        # (0003) and no INSERT on `sweep_exports` (0003 moved it to the settler).
+        # Under the old shared owner connection that discrepancy was invisible;
+        # it is now a production `permission denied` on `/resolve credit` and
+        # `/sweeplist`, which no test catches because the suites connect as the
+        # owner. The fix is the same shape as `/buy`: the bot relays, the settler
+        # executes. Tracked as review finding H1, out of scope for the C1 change
+        # that surfaced it — moving admin execution across a process boundary is
+        # its own piece of work, not a line in this constructor.
         admin = AdminOps(engine, owner_user_id=owner.id)
     else:
         log.warning("BOT_OWNER_TG_ID is not set: the TZ 3.4 admin commands are disabled")

@@ -349,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
 
     Fails closed on every startup input. A missing xpub credential, a private key
     where an account xpub should be, a MAC key shorter than 16 bytes or an unset
-    ``DATABASE_URL`` all stop the process here — before it can advertise itself
+    ``DERIVER_DATABASE_URL`` all stop the process here — before it can advertise itself
     as ready and start consuming requests it cannot finish.
     """
     logging.basicConfig(

@@ -19,6 +19,17 @@
 # LoadCredential=/files with 600 perms, not via docker-compose env vars —
 # this compose file is for local dev only.
 #
+# POSTGRES_USER below is the schema OWNER. It is not what any process connects
+# with: since migration 0009 each process logs in as its own role
+# (`notchstave_<process>_login`, member of the permission role holding its
+# grants) through its own `<PROCESS>_DATABASE_URL`. Those roles are created
+# without a password, so a fresh database needs one extra command after
+# `alembic upgrade head`, run once against this container:
+#
+#     python -m core.db.roles
+#
+# See .env.example's "Per-process database logins" section for the full order.
+#
 # `name:` below is deliberate, not decoration: neither this file nor
 # docker-compose.test.yml declared one before, so both fell back to Compose's
 # default project name (the directory name, "notchstave") and shared one

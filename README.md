@@ -58,7 +58,7 @@ Getting funds out is a manual, offline act: the owner runs `/sweeplist`, gets a 
 
 ## Architecture
 
-Six independently deployable processes, each with a role narrow enough to state in one sentence, and each running under its own PostgreSQL role with the minimum grants that role needs (migration `0002_roles_and_grants.py`):
+Six independently deployable processes, each with a role narrow enough to state in one sentence, and each *logging in* under its own PostgreSQL role with the minimum grants that role needs. The grants are in migration `0002_roles_and_grants.py` (amended by `0003`, `0006`, `0007`, `0008`); the logins that pick them up are in `0009_login_roles.py`, and each process reads its own connection URL (`SETTLER_DATABASE_URL`, `WATCHER_DATABASE_URL`, …) with no fallback to the schema owner's `DATABASE_URL` — see `core/db/roles.py` and the "Per-process database logins" section of `.env.example`. `settler/tests/test_login_roles.py` connects as all six and checks the denials over real authenticated sessions:
 
 | Process | Job | Makes money decisions? | Holds the xpub? |
 |---|---|---|---|
@@ -142,8 +142,17 @@ Infrastructure first, then each process. There is no single "start everything" c
 ```bash
 cp .env.example .env               # fill in real values; a real .env is never committed
 docker compose up -d               # Postgres, Redis, Prometheus, Grafana
-alembic upgrade head                # apply all migrations (0001 through 0008)
+alembic upgrade head               # apply all migrations (0001 through 0009)
+python -m core.db.roles            # set the six login-role passwords
 ```
+
+The last line is not optional and not a convenience. Migration `0009` creates one
+`LOGIN` role per process and deliberately leaves it with `PASSWORD NULL` — a
+migration lives in git, and a password in git is a password in every clone
+forever. Until this command runs, the roles exist and cannot authenticate, so the
+processes below refuse to start rather than falling back to a wider identity. It
+reads `NOTCHSTAVE_<PROCESS>_DB_PASSWORD` (or the matching systemd credentials),
+and re-running it is how a credential is rotated.
 
 Then, one terminal per process (each reads `.env` on its own):
 
