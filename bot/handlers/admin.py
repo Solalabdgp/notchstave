@@ -2,10 +2,13 @@
 
 **This module contains no money logic and must never acquire any.** Every
 command below parses arguments, checks one ``tg_id``, calls one method on
-:class:`settler.admin.AdminOps`, and renders the value object it gets back. The
-decisions — the two-step threshold, the CAS on ``resolved_at``, the entitlement
-insert, the audit row — all live on the other side of that call, under the
-*settler's* database role.
+:class:`settler.admin.client.AdminClient`, and renders the value object it gets
+back. The decisions — the two-step threshold, the CAS on ``resolved_at``, the
+entitlement insert, the audit row — all live on the other side of that call,
+under the *settler's* database role, and since migration 0012 in the settler's
+*process*: the call is a row in ``admin_action_requests`` and a wait on a
+``NOTIFY``. Nothing in the signatures changed, which is why this module barely
+did.
 
 That split is the answer to TZ 5.8/T7. Its premise is that the owner's Telegram
 account is captured; the ``tg_id`` check does nothing about that and is not
@@ -40,6 +43,7 @@ from bot.handlers.buyer import sender_id
 from bot.services import BotServices
 from settler.admin.errors import (
     AdminError,
+    BalancesUnavailable,
     ConfirmationRequired,
     InvalidConfirmationCode,
     ResolutionNotApplicable,
@@ -80,7 +84,16 @@ async def cmd_pending(message: Message, services: BotServices) -> None:
     if services.admin is None:
         await message.answer(admin_texts.admin_unconfigured())
         return
-    cases = await services.admin.pending()
+    # `/pending` used to be a local query and could not fail in a way worth
+    # catching. It is a request to another process now (migration 0012), so the
+    # settler being down is a normal outcome and has to read as one rather than
+    # as an aiogram traceback in a chat window.
+    try:
+        cases = await services.admin.pending(operator_id=services.config.owner_tg_id)
+    except AdminError as exc:
+        log.exception("/pending failed")
+        await message.answer(f"Could not read the open cases: {exc}")
+        return
     await message.answer(admin_texts.pending(cases))
 
 
@@ -191,9 +204,6 @@ async def cmd_sweeplist(message: Message, services: BotServices) -> None:
     if services.admin is None:
         await message.answer(admin_texts.admin_unconfigured())
         return
-    if services.balances is None:
-        await message.answer(admin_texts.balances_unavailable())
-        return
 
     asset = await services.repo.asset(
         chain_id=services.config.chain_id, symbol=services.config.asset_symbol
@@ -210,13 +220,25 @@ async def cmd_sweeplist(message: Message, services: BotServices) -> None:
     stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     filename = f"sweep-{asset.chain_id}-{asset.symbol.lower()}-{stamp}.csv"
 
-    export = await services.admin.sweeplist(
-        chain_id=asset.chain_id,
-        asset_id=asset.id,
-        balances=services.balances,
-        file_ref=filename,
-        operator_id=services.config.owner_tg_id,
-    )
+    try:
+        export = await services.admin.sweeplist(
+            chain_id=asset.chain_id,
+            asset_id=asset.id,
+            file_ref=filename,
+            operator_id=services.config.owner_tg_id,
+        )
+    except BalancesUnavailable:
+        # The check that used to live at the top of this handler, now raised by
+        # the process that owns the RPC pool. Same sentence for the owner: the
+        # command cannot answer, and an export built against unreadable balances
+        # would list every address as empty.
+        await message.answer(admin_texts.balances_unavailable())
+        return
+    except AdminError as exc:
+        log.exception("/sweeplist failed")
+        await message.answer(f"Could not build the sweep list: {exc}")
+        return
+
     await message.answer_document(
         BufferedInputFile(export.csv_text.encode("utf-8"), filename=filename),
         caption=admin_texts.sweeplist_caption(export),
@@ -231,9 +253,6 @@ async def cmd_reconcile(message: Message, services: BotServices) -> None:
     if services.admin is None:
         await message.answer(admin_texts.admin_unconfigured())
         return
-    if services.balances is None:
-        await message.answer(admin_texts.balances_unavailable())
-        return
 
     asset = await services.repo.asset(
         chain_id=services.config.chain_id, symbol=services.config.asset_symbol
@@ -246,9 +265,11 @@ async def cmd_reconcile(message: Message, services: BotServices) -> None:
         report = await services.admin.reconcile(
             chain_id=asset.chain_id,
             asset_id=asset.id,
-            balances=services.balances,
             operator_id=services.config.owner_tg_id,
         )
+    except BalancesUnavailable:
+        await message.answer(admin_texts.balances_unavailable())
+        return
     except Exception as exc:  # noqa: BLE001 — RPC and pricing both surface here
         # `UnknownRate` is the realistic one: a drift exists and cannot be
         # priced. Defaulting to a rate of 1 or 0 would either invent a

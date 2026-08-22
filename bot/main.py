@@ -23,14 +23,21 @@ owner is a user row like everybody else and :class:`~settler.admin.AdminOps` can
 be told which one it is (TZ 5.8/T7 wants admin notifications delivered to that
 row's chat).
 
-**Why the RPC pool is built here and tolerated missing.** ``/reconcile`` and
-``/sweeplist`` read on-chain balances through the watcher's pool — one rotation,
-one circuit breaker, one budget (TZ 5.6), and there is no second pool in this
-repository. Building it needs provider URLs on the ``chains`` row, which a fresh
-checkout does not have. A failure here therefore disables those two commands
-with a message that says so, rather than stopping the bot: a payment bot that
-will not start because a *reconciliation* dependency is missing is a worse
-outcome than two owner commands answering honestly.
+**There is no RPC pool here any more.** ``/reconcile`` and ``/sweeplist`` read
+on-chain balances, and until migration 0012 this process built the pool that did
+it — which meant the bot carried ``web3``, a provider rotation and a circuit
+breaker (TZ 5.6) in order to run two commands whose results it has no grant to
+write. Both now execute in the settler, which is where the pool went with them.
+A deployment whose ``chains`` row has no ``rpc_urls`` still gets an honest
+refusal, raised there and rendered here.
+
+**The admin commands are a queue, not a call.** ``AdminOps`` used to be built on
+this process's engine, and once migration 0009 gave every process its own login
+role that stopped working: ``/resolve credit`` reaches ``INSERT INTO
+entitlements`` as ``notchstave_bot_login``, which migration 0003 revoked in
+writing. So this process builds an
+:class:`~settler.admin.client.AdminClient` instead — the same four methods, the
+same value objects, the same exception classes, one table in between.
 """
 
 from __future__ import annotations
@@ -54,8 +61,7 @@ from core.invoicing.client import InvoiceClient
 from core.invoicing.integrity import load_integrity_key
 from core.invoicing.proof import ProofClient
 from core.telegram import load_bot_token
-from settler.admin.balances import BalanceSource
-from settler.admin.ops import AdminOps
+from settler.admin.client import AdminClient
 
 log = logging.getLogger("notchstave.bot")
 
@@ -93,77 +99,28 @@ def psycopg_dsn(url: str | None = None) -> str:
     return roles_psycopg_dsn(url or _database_url())
 
 
-async def build_balance_source(engine: AsyncEngine, chain_id: int) -> BalanceSource | None:
-    """The watcher's RPC pool for one chain, or ``None`` with a reason logged.
-
-    Imported inside the function because it pulls in ``web3``: a bot that cannot
-    reconcile should still start in a couple of hundred milliseconds, and the
-    two commands that need this are run by one person occasionally.
-    """
-    try:
-        import sqlalchemy as sa
-
-        from settler.admin.balances import RpcBalanceSource
-        from watcher.config import WatcherSettings, build_pool
-        from watcher.store.base import ChainConfigRow
-
-        async with engine.begin() as conn:
-            row = (
-                await conn.execute(
-                    sa.text(
-                        "SELECT chain_id, name, rpc_urls, min_confirmations, "
-                        "       credit_threshold_usd, use_finalized_tag, "
-                        "       last_indexed_block, is_enabled "
-                        "  FROM chains WHERE chain_id = :chain_id"
-                    ),
-                    {"chain_id": chain_id},
-                )
-            ).mappings().first()
-        if row is None or not row["rpc_urls"]:
-            log.warning(
-                "chain %s has no rpc_urls: /reconcile and /sweeplist are disabled", chain_id
-            )
-            return None
-
-        pool = build_pool(ChainConfigRow(**dict(row)), WatcherSettings.from_env())
-        return RpcBalanceSource(pool)
-    except Exception as exc:  # noqa: BLE001 — startup convenience, never a payment path
-        log.warning(
-            "no RPC balance source for chain %s (%s: %s): /reconcile and /sweeplist "
-            "will say so rather than reconcile against zero",
-            chain_id,
-            type(exc).__name__,
-            exc,
-        )
-        return None
-
-
 async def build_services(engine: AsyncEngine, config: BotConfig) -> BotServices:
     """Everything the handlers may reach for, built once."""
     key = load_integrity_key()
     dsn = psycopg_dsn()
     repo = BotRepository(engine)
 
-    admin: AdminOps | None = None
+    admin: AdminClient | None = None
     if config.owner_tg_id is not None:
-        # The owner is an ordinary `users` row. Creating it here rather than
-        # requiring a manual INSERT means the admin notifications of TZ 5.8/T7
-        # have somewhere to go from the first start.
-        owner = await repo.upsert_user(config.owner_tg_id)
-        # TODO(C1 follow-up): `engine` is the *bot's* engine, so since the
-        # per-process login roles went in, every AdminOps write runs as
-        # `notchstave_bot_login`. The docstrings in `settler/admin/` say the
-        # settler executes owner money decisions under its own role, and the
-        # grant matrix agrees — `notchstave_bot` has no INSERT on `entitlements`
-        # (0003) and no INSERT on `sweep_exports` (0003 moved it to the settler).
-        # Under the old shared owner connection that discrepancy was invisible;
-        # it is now a production `permission denied` on `/resolve credit` and
-        # `/sweeplist`, which no test catches because the suites connect as the
-        # owner. The fix is the same shape as `/buy`: the bot relays, the settler
-        # executes. Tracked as review finding H1, out of scope for the C1 change
-        # that surfaced it — moving admin execution across a process boundary is
-        # its own piece of work, not a line in this constructor.
-        admin = AdminOps(engine, owner_user_id=owner.id)
+        # The owner is an ordinary `users` row, and it is created here rather
+        # than by hand for a reason that outlived the call it was written for:
+        # the settler resolves `BOT_OWNER_TG_ID` to a `users.id` so the TZ
+        # 5.8/T7 admin notifications have a destination, and it holds SELECT on
+        # that table and cannot create the row itself (0002, 0003). This upsert
+        # is what makes those alarms deliverable from the first start.
+        await repo.upsert_user(config.owner_tg_id)
+        # Not `AdminOps(engine, ...)`. That ran every owner money decision under
+        # `notchstave_bot_login`, which migration 0003 revoked `INSERT` on
+        # `entitlements` from in writing — invisible while every process shared
+        # the owner connection, a production `permission denied` on
+        # `/resolve credit` once migration 0009 gave each process its own role.
+        # Review finding H1; migration 0012 is the fix and this line is it.
+        admin = AdminClient(dsn)
     else:
         log.warning("BOT_OWNER_TG_ID is not set: the TZ 3.4 admin commands are disabled")
 
@@ -173,7 +130,6 @@ async def build_services(engine: AsyncEngine, config: BotConfig) -> BotServices:
         invoices=InvoiceClient(dsn, key, timeout=config.request_timeout_seconds),
         proofs=ProofClient(dsn, key, timeout=config.request_timeout_seconds),
         admin=admin,
-        balances=await build_balance_source(engine, config.chain_id),
     )
 
 
@@ -211,12 +167,11 @@ async def main() -> None:
     dispatcher = build_dispatcher(services)
 
     log.info(
-        "bot started: chain=%s asset=%s owner=%s admin=%s balances=%s",
+        "bot started: chain=%s asset=%s owner=%s admin=%s",
         config.chain_id,
         config.asset_symbol,
         "set" if config.owner_tg_id is not None else "unset",
         "on" if services.admin is not None else "off",
-        "on" if services.balances is not None else "off",
     )
     try:
         # Drop whatever queued while the process was down. A restart must not

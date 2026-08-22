@@ -26,6 +26,9 @@ __all__ = [
     "ConfirmationRequired",
     "InvalidConfirmationCode",
     "ConfirmationUnavailable",
+    "BalancesUnavailable",
+    "AdminActionFailed",
+    "AdminUnavailable",
 ]
 
 
@@ -109,4 +112,56 @@ class ConfirmationUnavailable(AdminError):
     disabling a control is how controls stop existing. TZ section 9 puts this key
     with the settler under ``LoadCredential=``, alongside
     ``INVOICE_INTEGRITY_KEY``.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Raised across the queue of migration 0012
+# ---------------------------------------------------------------------------
+#
+# The three below exist because the admin commands stopped being function calls
+# in the bot process and became requests to the settler (migration 0012). Two of
+# them describe a settler that could not answer; the third describes one that
+# answered with something this vocabulary has no word for. All three are
+# `AdminError` so that a handler written against the in-process call — `except
+# AdminError` — keeps catching everything it used to.
+
+
+class BalancesUnavailable(AdminError):
+    """`/reconcile` and `/sweeplist` need on-chain balances and there are none.
+
+    The settler builds one :class:`~settler.admin.balances.RpcBalanceSource` per
+    chain from ``chains.rpc_urls`` and a fresh checkout has none, so this is the
+    ordinary answer on a half-configured deployment rather than a fault.
+
+    Fails **closed**, and that is the point: reconciling against an unreachable
+    chain would read every balance as zero and report that the entire float is
+    missing — the single most alarming wrong answer this system can produce.
+    """
+
+
+class AdminActionFailed(AdminError):
+    """The settler raised something that is not an :class:`AdminError`.
+
+    ``/reconcile`` reaches RPC and pricing, either of which can fail in ways
+    :mod:`settler.admin` has no vocabulary for (``UnknownRate``, a circuit
+    breaker that is open, a provider returning nonsense). Those used to surface
+    in the bot as themselves, because the call was in-process; across a queue
+    only the class *name* survives, so they arrive as this and carry the
+    settler's message.
+
+    The message is passed through rather than replaced. The audience for these
+    four commands is one operator who owns the deployment and is the only person
+    who can act on "all three providers are rate-limiting" — sanitising that into
+    "something went wrong" would be protecting them from their own logs.
+    """
+
+
+class AdminUnavailable(AdminError):
+    """The request was never answered: no settler, or not in time.
+
+    Distinct from :class:`AdminActionFailed`, and the distinction is the one the
+    owner needs: this means **nothing happened**. The row is not withdrawn and
+    may still be served — which is why the message says so rather than inviting
+    an immediate retry of a credit that might already be in flight.
     """

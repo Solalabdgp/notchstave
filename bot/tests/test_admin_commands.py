@@ -12,7 +12,7 @@ else out, and there are three ways that goes wrong quietly:
    whoever is probing that ``/resolve`` exists and therefore that there is an
    owner account worth phishing.
 3. The denial happens after the service call rather than before it. Every test
-   here asserts on :attr:`FakeAdminOps.calls` being empty, because a check that
+   here asserts on :attr:`FakeAdminClient.calls` being empty, because a check that
    runs but does not stop anything is the worst of both.
 
 The money behind these commands is not retested here — ``settler/tests``
@@ -40,6 +40,8 @@ from bot.tests.conftest import (
     make_user,
 )
 from settler.admin.errors import (
+    AdminUnavailable,
+    BalancesUnavailable,
     ConfirmationRequired,
     InvalidConfirmationCode,
     ReviewAlreadyResolved,
@@ -107,7 +109,7 @@ async def test_a_non_owner_is_denied_and_the_service_is_never_called(
 ) -> None:
     reply = await harness.send(command, tg_id=BUYER_TG_ID)
 
-    assert harness.admin.calls == [], f"{command} reached AdminOps for a non-owner"
+    assert harness.admin.calls == [], f"{command} reached the settler for a non-owner"
     assert reply == texts.admin_denied()
 
 
@@ -153,7 +155,7 @@ async def test_pending_lists_the_open_cases_for_the_owner(harness: Harness) -> N
 
     reply = await harness.send("/pending", tg_id=OWNER_TG_ID)
 
-    assert harness.admin.calls == [("pending", {"limit": 200})]
+    assert harness.admin.calls == [("pending", {"limit": 200, "operator_id": OWNER_TG_ID})]
     assert "#1" in reply
     assert "underpaid" in reply
     assert str(invoice_id) in reply
@@ -434,13 +436,36 @@ async def test_sweeplist_sends_the_csv_as_a_document(
 async def test_sweeplist_without_a_balance_source_says_so_instead_of_reporting_zero(
     harness: Harness,
 ) -> None:
-    """Reconciling against nothing reads as "the money is gone" (TZ section 7)."""
-    object.__setattr__(harness.services, "balances", None)
+    """Reconciling against nothing reads as "the money is gone" (TZ section 7).
+
+    The check moved processes with the command (migration 0012): the bot no
+    longer holds an RPC pool and cannot know whether one exists, so the settler
+    refuses with :class:`~settler.admin.errors.BalancesUnavailable` and this
+    handler renders the same sentence it used to render off its own ``None``.
+    What must not change is the sentence and the absence of a document.
+    """
+    harness.admin.sweep_error = BalancesUnavailable("chain 8453 has no rpc_urls")
 
     reply = await harness.send("/sweeplist", tg_id=OWNER_TG_ID)
 
-    assert harness.admin.calls == []
+    assert harness.session.documents == []
     assert "not available to this process" in reply
+
+
+async def test_an_unreachable_settler_is_reported_and_not_a_traceback(
+    harness: Harness,
+) -> None:
+    """The failure a queue adds. `/pending` had no error path before 0012.
+
+    The message must not read as "there are no open cases": an owner who is told
+    the queue is empty when the settler is down stops looking.
+    """
+    harness.admin.pending_error = AdminUnavailable("the settler has not answered")
+
+    reply = await harness.send("/pending", tg_id=OWNER_TG_ID)
+
+    assert "Could not read the open cases" in reply
+    assert "has not answered" in reply
 
 
 async def test_reconcile_reports_a_clean_ledger(harness: Harness, shop: Shop) -> None:

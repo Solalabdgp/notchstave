@@ -70,8 +70,7 @@ from bot.services import BotServices  # noqa: E402
 from core.invoicing.client import InvoiceClient  # noqa: E402
 from core.invoicing.proof import DerivationProof, ProofClient  # noqa: E402
 from core.invoicing.service import InvoiceView  # noqa: E402
-from settler.admin.balances import BalanceSource  # noqa: E402
-from settler.admin.ops import AdminOps  # noqa: E402
+from settler.admin.client import AdminClient  # noqa: E402
 from settler.admin.reviews import PendingCase, ResolutionResult  # noqa: E402
 from settler.tests.conftest import _DATA_TABLES, World, database_url  # noqa: E402
 
@@ -488,26 +487,39 @@ class FakeProofClient:
 
 
 @dataclass
-class FakeAdminOps:
-    """Stands in for :class:`settler.admin.ops.AdminOps`.
+class FakeAdminClient:
+    """Stands in for :class:`settler.admin.client.AdminClient`.
 
     The money logic behind it has its own suite against a real database
     (``settler/tests/test_admin_resolve.py``, ``test_reconcile.py``,
-    ``test_sweeplist.py``). What the bot owes is narrower and is what this
-    records: that a non-owner never reaches these methods at all, and that an
-    owner reaches them with the arguments they typed.
+    ``test_sweeplist.py``), and since migration 0012 the *transport* has one too
+    (``settler/tests/test_admin_queue.py``). What the bot owes is narrower and is
+    what this records: that a non-owner never reaches these methods at all, and
+    that an owner reaches them with the arguments they typed.
+
+    It replaced a ``FakeAdminOps`` when the admin commands moved processes. The
+    only difference in the surface is the one the move produced: no ``balances``
+    argument, because the bot no longer holds an RPC pool, and a
+    ``BalancesUnavailable`` now arrives as a refusal from the settler rather than
+    as a ``None`` this process checks for.
     """
 
     pending_cases: tuple[PendingCase, ...] = ()
+    pending_error: Exception | None = None
     resolution: ResolutionResult | None = None
     resolve_error: Exception | None = None
     reconcile_result: Any = None
     reconcile_error: Exception | None = None
     sweep_result: Any = None
+    sweep_error: Exception | None = None
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
-    async def pending(self, *, limit: int = 200) -> tuple[PendingCase, ...]:
-        self.calls.append(("pending", {"limit": limit}))
+    async def pending(
+        self, *, limit: int = 200, operator_id: int | None = None
+    ) -> tuple[PendingCase, ...]:
+        self.calls.append(("pending", {"limit": limit, "operator_id": operator_id}))
+        if self.pending_error is not None:
+            raise self.pending_error
         return self.pending_cases
 
     async def resolve(
@@ -544,19 +556,9 @@ class FakeAdminOps:
 
     async def sweeplist(self, **kwargs: Any) -> Any:
         self.calls.append(("sweeplist", kwargs))
+        if self.sweep_error is not None:
+            raise self.sweep_error
         return self.sweep_result
-
-
-@dataclass
-class FakeBalanceSource:
-    """Enough of :class:`settler.admin.balances.BalanceSource` to be present.
-
-    Its *presence* is what the admin handlers branch on; the balances themselves
-    are consumed inside :class:`FakeAdminOps`, which never calls it.
-    """
-
-    async def balance_of(self, *, address: str, asset: Any) -> Decimal:
-        return Decimal(0)  # pragma: no cover - AdminOps is faked above it
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +576,7 @@ class Harness:
     services: BotServices
     invoices: FakeInvoiceClient
     proofs: FakeProofClient
-    admin: FakeAdminOps
+    admin: FakeAdminClient
     _update_id: int = 0
 
     async def send(self, text: str, *, tg_id: int = BUYER_TG_ID) -> str:
@@ -638,7 +640,7 @@ async def _harness(
 
     invoices = FakeInvoiceClient()
     proofs = FakeProofClient()
-    admin = FakeAdminOps()
+    admin = FakeAdminClient()
 
     services = BotServices(
         config=BotConfig(
@@ -658,8 +660,7 @@ async def _harness(
         # rather than by loosening the dataclass.
         invoices=cast(InvoiceClient, invoices),
         proofs=cast(ProofClient, proofs),
-        admin=cast(AdminOps, admin) if with_admin else None,
-        balances=cast(BalanceSource, FakeBalanceSource()) if with_admin else None,
+        admin=cast(AdminClient, admin) if with_admin else None,
     )
 
     dispatcher = build_dispatcher(services)

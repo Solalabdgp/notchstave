@@ -40,8 +40,12 @@ sign or broadcast a transaction. "Компрометация самого при
 true, and the way it keeps it true is by not containing the capability.
 """
 
+from settler.admin.client import AdminClient
 from settler.admin.errors import (
+    AdminActionFailed,
     AdminError,
+    AdminUnavailable,
+    BalancesUnavailable,
     ConfirmationRequired,
     InvalidConfirmationCode,
     ResolutionNotApplicable,
@@ -50,6 +54,7 @@ from settler.admin.errors import (
 )
 from settler.admin.ops import AdminOps
 from settler.admin.policy import DEFAULT_ADMIN_POLICY, AdminPolicy
+from settler.admin.queue import AdminWorker
 from settler.admin.reconcile import AddressDrift, ReconcileReport, reconcile
 from settler.admin.reviews import (
     PendingCase,
@@ -62,9 +67,14 @@ from settler.admin.sweeplist import SweepExport, SweepRow, generate_sweep_list
 
 __all__ = [
     "AddressDrift",
+    "AdminActionFailed",
+    "AdminClient",
     "AdminError",
     "AdminOps",
     "AdminPolicy",
+    "AdminUnavailable",
+    "AdminWorker",
+    "BalancesUnavailable",
     "ConfirmationRequired",
     "DEFAULT_ADMIN_POLICY",
     "InvalidConfirmationCode",

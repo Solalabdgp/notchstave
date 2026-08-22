@@ -31,10 +31,16 @@ What one pass does, in this order:
    the six steps above have just decided.
 
 The owner-facing commands of TZ 3.4 — `/pending`, `/resolve`, `/sweeplist`,
-`/reconcile` — are **not** on this loop. They are in :mod:`settler.admin`,
-called on demand, because each of them is a decision a human takes rather than a
-state the database drifts into. `/reconcile` is the one that will eventually
-want a schedule; see the TODO at the end of :mod:`settler.admin.reconcile`.
+`/reconcile` — are **not** on this loop, and since migration 0012 they are in
+this process. They run on a second loop of their own
+(:func:`serve_admin_requests`), draining the ``admin_action_requests`` queue the
+bot writes: each of them is a decision a human takes rather than a state the
+database drifts into, and each of them needs the settler's database role, which
+the bot process does not have and must not have. The two loops are separate so
+that an owner pressing `/pending` does not wait behind two hundred settlements
+and so that a `/reconcile` walking the chain over RPC cannot stall the money
+pass. `/reconcile` is the one that will eventually want a schedule as well; see
+the TODO at the end of :mod:`settler.admin.reconcile`.
 
 **This process needs ``INVOICE_INTEGRITY_KEY``** and refuses to start without
 it. TZ 5.8/T1.3 names the settler as one of the three re-check points for
@@ -82,6 +88,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from core.db.roles import process_database_url
 from core.invoicing.integrity import load_integrity_key
 from settler import metrics
+from settler.admin.balances import BalanceSource
+from settler.admin.errors import BalancesUnavailable
+from settler.admin.ops import AdminOps
+from settler.admin.queue import AdminWorker
 from settler.locks import InvoiceLock, NullLock
 from settler.policy import MoneyPolicy
 from settler.service import DEFAULT_ADDRESS_COOLDOWN, LIVE_INVOICE_STATUSES, Settler
@@ -142,6 +152,116 @@ def _address_cooldown() -> dt.timedelta:
     """
     raw = os.environ.get("SETTLER_ADDRESS_COOLDOWN_SECONDS", "").strip()
     return DEFAULT_ADDRESS_COOLDOWN if not raw else dt.timedelta(seconds=float(raw))
+
+
+SQL_OWNER_USER_ID = sa.text("SELECT id FROM users WHERE tg_id = :tg_id")
+
+
+async def resolve_owner_user_id(engine: AsyncEngine) -> int | None:
+    """The ``users.id`` behind ``BOT_OWNER_TG_ID``, or ``None``.
+
+    :class:`~settler.admin.ops.AdminOps` wants it for the TZ 5.8/T7 admin
+    notifications — "somebody credited $240 by hand" has to arrive somewhere, and
+    that somewhere is a ``users`` row.
+
+    **Resolved here and not carried on the request.** ``admin_action_requests``
+    already carries ``requested_by``, and using it for this would be handing a
+    compromised bot the ability to name where the alarms about its own behaviour
+    are delivered. The settler reads the deployment's configuration instead. That
+    is also why the variable is the bot's own ``BOT_OWNER_TG_ID`` rather than a
+    second name: two variables for one person is a drift waiting to happen, and
+    the drift would be silent — notifications addressed to nobody.
+
+    ``None`` is the safe state and the ordinary one before the bot has started
+    once: this process holds SELECT on ``users`` and cannot create the row (0002,
+    0003), so it reports that the notifications have no destination rather than
+    inventing one.
+    """
+    raw = os.environ.get("BOT_OWNER_TG_ID", "").strip()
+    if not raw:
+        log.warning("BOT_OWNER_TG_ID is not set: admin notifications have no destination")
+        return None
+    async with engine.connect() as conn:
+        row = (await conn.execute(SQL_OWNER_USER_ID, {"tg_id": int(raw)})).first()
+    if row is None:
+        log.warning(
+            "no users row for BOT_OWNER_TG_ID=%s yet: admin notifications are disabled "
+            "until the bot has seen the owner once",
+            raw,
+        )
+        return None
+    return int(row[0])
+
+
+class ChainBalanceProvider:
+    """One :class:`~settler.admin.balances.RpcBalanceSource` per chain, built lazily.
+
+    This class is why ``/reconcile`` and ``/sweeplist`` moved processes rather
+    than merely moving roles. Both need on-chain balances; that pool used to be
+    built in ``bot/main.py``, which meant the bot process carried ``web3``, an
+    RPC rotation and a circuit breaker in order to run two commands whose
+    decisions it is not allowed to write. It does not any more.
+
+    **Lazy, and cached per chain.** Building a pool reads ``chains.rpc_urls`` and
+    opens providers; doing that at start-up would put a network dependency in
+    front of the settler's money loop, which is the one thing this process must
+    keep running when RPC is unhappy. Doing it per request would rebuild a
+    circuit breaker whose whole value is memory across calls (TZ 5.6).
+
+    **A failure raises rather than returning ``None``.** A caller handed ``None``
+    reconciles against zero and reports that the entire float is missing, which
+    is this system's most alarming wrong answer; see
+    :class:`~settler.admin.errors.BalancesUnavailable`.
+    """
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+        self._sources: dict[int, BalanceSource] = {}
+
+    async def for_chain(self, chain_id: int) -> BalanceSource:
+        cached = self._sources.get(chain_id)
+        if cached is not None:
+            return cached
+        source = await self._build(chain_id)
+        self._sources[chain_id] = source
+        return source
+
+    async def _build(self, chain_id: int) -> BalanceSource:
+        # Imported inside the function because it pulls in ``web3``:
+        # :mod:`settler.service` states as an invariant that the settler's money
+        # path holds no RPC client, and an import at module scope would make that
+        # claim depend on nobody reading it as permission.
+        try:
+            from settler.admin.balances import RpcBalanceSource
+            from watcher.config import WatcherSettings, build_pool
+            from watcher.store.base import ChainConfigRow
+
+            async with self._engine.begin() as conn:
+                row = (
+                    await conn.execute(
+                        sa.text(
+                            "SELECT chain_id, name, rpc_urls, min_confirmations, "
+                            "       credit_threshold_usd, use_finalized_tag, "
+                            "       last_indexed_block, is_enabled "
+                            "  FROM chains WHERE chain_id = :chain_id"
+                        ),
+                        {"chain_id": chain_id},
+                    )
+                ).mappings().first()
+            if row is None or not row["rpc_urls"]:
+                raise BalancesUnavailable(
+                    f"chain {chain_id} has no rpc_urls: /reconcile and /sweeplist "
+                    "cannot read balances"
+                )
+            pool = build_pool(ChainConfigRow(**dict(row)), WatcherSettings.from_env())
+            return RpcBalanceSource(pool)
+        except BalancesUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 — config, import and driver all land here
+            raise BalancesUnavailable(
+                f"no RPC balance source for chain {chain_id} "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
 
 
 def build_lock() -> InvoiceLock:
@@ -217,9 +337,38 @@ async def run_once(settler: Settler, engine: AsyncEngine, *, batch: int = 200) -
         )
 
 
+async def serve_admin_requests(
+    worker: AdminWorker, stopping: asyncio.Event, interval: float
+) -> None:
+    """The owner-command queue of migration 0012, on its own tick.
+
+    A second loop rather than a seventh step in :func:`run_once`, and the reason
+    is who is waiting. Steps 1-7 are batch work whose latency budget is minutes;
+    a pass that settles two hundred invoices and then sweeps the address pool can
+    take seconds, and putting ``/pending`` behind it would make an owner command's
+    response time a function of how busy the shop is. The money loop must never
+    wait on RPC either, which a ``/reconcile`` in the same task would make it do.
+
+    Two tasks on one engine is not a new hazard: before migration 0012 the bot
+    called :class:`~settler.admin.ops.AdminOps` concurrently with this loop
+    against the same rows, and every write on both sides is a compare-and-set for
+    exactly that reason. What changes is only which process holds the connection.
+    """
+    while not stopping.is_set():
+        try:
+            served = await worker.run_once()
+            if served:
+                log.info("served %d admin request(s)", served)
+        except Exception:  # noqa: BLE001 — a bad command must not kill the loop
+            log.exception("admin queue pass failed")
+        with suppress(TimeoutError):
+            await asyncio.wait_for(stopping.wait(), timeout=interval)
+
+
 async def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     interval = float(os.environ.get("SETTLER_POLL_INTERVAL_SECONDS", "5"))
+    admin_interval = float(os.environ.get("SETTLER_ADMIN_POLL_INTERVAL_SECONDS", "1"))
     metrics_port = int(os.environ.get("SETTLER_METRICS_PORT", "9103"))
 
     # Not fatal if it fails (a bad port, one already bound) — same call as
@@ -248,6 +397,16 @@ async def main() -> None:
         address_cooldown=_address_cooldown(),
     )
 
+    # Migration 0012. The owner's Telegram id reaches the settler on each request
+    # and is recorded rather than trusted, so `owner_user_id` here is the
+    # deployment-wide one used for the TZ 5.8/T7 notifications — read from the
+    # environment because this process has no Telegram identity of its own.
+    admin_worker = AdminWorker(
+        engine,
+        AdminOps(engine, owner_user_id=await resolve_owner_user_id(engine)),
+        balances=ChainBalanceProvider(engine),
+    )
+
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -255,6 +414,9 @@ async def main() -> None:
             loop.add_signal_handler(sig, stopping.set)
 
     log.info("settler started, policy=%s", settler.policy.version)
+    admin_task = asyncio.create_task(
+        serve_admin_requests(admin_worker, stopping, admin_interval)
+    )
     try:
         while not stopping.is_set():
             try:
@@ -264,6 +426,8 @@ async def main() -> None:
             with suppress(TimeoutError):
                 await asyncio.wait_for(stopping.wait(), timeout=interval)
     finally:
+        stopping.set()
+        await admin_task
         await engine.dispose()
         log.info("settler stopped")
 

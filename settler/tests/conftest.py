@@ -71,6 +71,12 @@ TEST_INTEGRITY_KEY = IntegrityKey(os.environ["INVOICE_INTEGRITY_KEY"])
 #: foreign keys, and ``RESTART IDENTITY`` means an assertion can say "entitlement
 #: 1" without depending on how many tests ran before it.
 _DATA_TABLES = (
+    # No foreign keys at all (migration 0012), so `CASCADE` from any other table
+    # will never reach it — unlike `invoice_requests` and
+    # `address_lifecycle_requests`, which are pulled in through `invoices` and
+    # `receive_addresses`. Named explicitly or a `/resolve` left behind by one
+    # test is claimed by the worker in the next.
+    "admin_action_requests",
     "audit_log",
     "notifications",
     "manual_reviews",
