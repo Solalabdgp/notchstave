@@ -24,6 +24,11 @@ What one pass does, in this order:
 5. **Sweep expired.** Top-up windows that closed since the last pass.
 6. **Anomalies.** Payments that no invoice will ever ask about — chiefly
    ``unassigned_payment``, which by definition has no invoice to settle.
+7. **Address pool.** Ask the deriver to latch every address that has seen money
+   and to schedule the return of every address whose invoice is finished and
+   never held any (TZ 5.1 p. 2, migration 0011), then publish the reserved-
+   address gauge the T5.2 alert reads. Last in the pass because it reads what
+   the six steps above have just decided.
 
 The owner-facing commands of TZ 3.4 — `/pending`, `/resolve`, `/sweeplist`,
 `/reconcile` — are **not** on this loop. They are in :mod:`settler.admin`,
@@ -64,6 +69,7 @@ these numbers into Prometheus this week; see :func:`settler.metrics
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
 import signal
@@ -78,7 +84,7 @@ from core.invoicing.integrity import load_integrity_key
 from settler import metrics
 from settler.locks import InvoiceLock, NullLock
 from settler.policy import MoneyPolicy
-from settler.service import LIVE_INVOICE_STATUSES, Settler
+from settler.service import DEFAULT_ADDRESS_COOLDOWN, LIVE_INVOICE_STATUSES, Settler
 
 log = logging.getLogger("notchstave.settler")
 
@@ -124,6 +130,18 @@ def _database_url() -> str:
 
 def build_engine(url: str | None = None) -> AsyncEngine:
     return create_async_engine(url or _database_url(), pool_pre_ping=True)
+
+
+def _address_cooldown() -> dt.timedelta:
+    """``SETTLER_ADDRESS_COOLDOWN_SECONDS``, or the default hour.
+
+    Read here rather than inside :mod:`settler.service` for the reason
+    :class:`settler.policy.MoneyPolicy` gives about its own thresholds: a test
+    must be able to hand in a different value, and a settings singleton read
+    three call frames down quietly makes that impossible.
+    """
+    raw = os.environ.get("SETTLER_ADDRESS_COOLDOWN_SECONDS", "").strip()
+    return DEFAULT_ADDRESS_COOLDOWN if not raw else dt.timedelta(seconds=float(raw))
 
 
 def build_lock() -> InvoiceLock:
@@ -184,6 +202,20 @@ async def run_once(settler: Settler, engine: AsyncEngine, *, batch: int = 200) -
     await settler.sweep_expired()
     await settler.review_anomalies()
 
+    # Last, and last for a reason: it reads the state the four passes above have
+    # just written. An invoice that expired thirty lines ago is already terminal
+    # by the time this looks, so its address is asked for in the same tick rather
+    # than in the next one — which for the pass that refills the address pool is
+    # the difference between a shop that keeps working and one that runs out of
+    # addresses in a week (TZ 5.1 p. 2, 5.8/T5.2).
+    latched, released = await settler.sync_addresses()
+    if latched or released:
+        log.info(
+            "address pool: asked the deriver to latch %d and release %d address(es)",
+            latched,
+            released,
+        )
+
 
 async def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -213,6 +245,7 @@ async def main() -> None:
         policy=MoneyPolicy.from_env(),
         lock=build_lock(),
         integrity_key=integrity_key,
+        address_cooldown=_address_cooldown(),
     )
 
     stopping = asyncio.Event()

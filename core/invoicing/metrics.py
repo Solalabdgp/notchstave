@@ -5,17 +5,24 @@ Two are declared here because this is the only component that can observe them:
     notchstave_invoices_created_total{chain,asset}
     notchstave_invoice_ratelimit_hits_total{scope}
 
-Three are **re-exported** from :mod:`core.metrics` rather than declared, because
+Two are **re-exported** from :mod:`core.metrics` rather than declared, because
 they have a second observer in another process and a name claimed twice raises
 ``DuplicateTimeseries`` the moment one process imports both modules:
 
     notchstave_address_mismatch_total        also checked by the settler (T1.1)
     notchstave_invoice_mac_failures_total    also checked by the settler (T1.3)
-    notchstave_active_reserved_addresses     also reported by the watcher (T5.2)
 
 See the docstring of :mod:`core.metrics` for the full argument; the short
 version is that ``/reconcile`` already made this a real crash once, not a
 hypothetical one.
+
+``notchstave_active_reserved_addresses`` was a third such re-export and is no
+longer written from this package at all. The count it took here was of *live
+invoices* — a different quantity from reserved addresses — and it ran inside the
+deriver process, which serves no ``/metrics``. Its one writer is now
+:func:`settler.service.publish_reserved_address_gauge`. The alias below stays
+exported so the T5 tests and any dashboard-adjacent import keep resolving to the
+same family object; nothing in ``core.invoicing`` sets it.
 
 **Why ``invoices_created_total`` is labelled by asset and not by product.** TZ
 section 7 specifies ``{chain,asset}`` and the reason shows up in the alert next

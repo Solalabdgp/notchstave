@@ -24,7 +24,7 @@ import pytest
 from core.invoicing import errors
 from core.invoicing.config import InvoicingPolicy
 from core.invoicing.integrity import IntegrityKey
-from core.invoicing.metrics import ACTIVE_RESERVED_ADDRESSES, RATELIMIT_HITS
+from core.invoicing.metrics import RATELIMIT_HITS
 from core.invoicing.tests.conftest import (
     FakeDeriver,
     Shop,
@@ -264,22 +264,18 @@ def test_one_payment_in_the_streak_stops_the_cooldown(
     buy(conn, deriver, key, shop, policy=policy)
 
 
-def test_the_reserved_address_gauge_tracks_the_ledger(
-    conn: psycopg.Connection[Any], world: World, deriver: FakeDeriver, key: IntegrityKey
-) -> None:
-    """TZ section 7 — the series the 80%-of-ceiling alert reads.
-
-    Set from a count rather than incremented, because the other writer of this
-    number lives in the settler's world (an expiry lowers it) and a
-    process-local counter would drift away from the ledger the alert is
-    supposed to describe.
-    """
-    shop = world.shop(pooled_addresses=3, deriver=deriver)
-
-    buy(conn, deriver, key, shop)
-    buy(conn, deriver, key, shop)
-
-    assert sample_value(ACTIVE_RESERVED_ADDRESSES, chain=str(shop.chain_id)) == 2.0
+# `test_the_reserved_address_gauge_tracks_the_ledger` used to live here and was
+# deleted rather than repaired. It asserted that `create_invoice` set
+# `notchstave_active_reserved_addresses`, which it did — from a count of live
+# *invoices*, which is not the quantity the TZ 5.8/T5.2 alert reads, and inside
+# the deriver process, which serves no `/metrics` at all, so the value it
+# asserted on was never visible to Prometheus in production. The test passed and
+# the metric was blind, which is the worst arrangement of the two.
+#
+# The gauge now has one writer, in the settler, counting rows in
+# `receive_addresses`. Its test moved with it:
+# `settler/tests/test_address_pool.py::test_the_reserved_gauge_counts_addresses
+# _and_comes_back_down`.
 
 
 # ---------------------------------------------------------------------------

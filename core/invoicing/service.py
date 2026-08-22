@@ -75,7 +75,6 @@ from core.invoicing.errors import (
 from core.invoicing.ids import public_token, uuid7
 from core.invoicing.integrity import IntegrityKey, compute_mac, verify_mac
 from core.invoicing.metrics import (
-    ACTIVE_RESERVED_ADDRESSES,
     ADDRESS_MISMATCH,
     INVOICES_CREATED,
     MAC_FAILURES,
@@ -336,13 +335,6 @@ SQL_LOAD_INVOICE_BY_ID = _SQL_INVOICE_SELECT + " WHERE i.id = %(invoice_id)s"
 
 SQL_LOAD_INVOICE_BY_TOKEN = _SQL_INVOICE_SELECT + " WHERE i.public_token = %(public_token)s"
 
-SQL_COUNT_RESERVED_ON_CHAIN = """
-SELECT count(*) AS n
-  FROM invoices
- WHERE chain_id = %(chain_id)s
-   AND status = ANY(%(live)s::invoice_status[])
-"""
-
 SQL_AUDIT = """
 INSERT INTO audit_log (actor_kind, actor_id, action, target_kind, target_id,
                        after_state, args_json, policy_version)
@@ -552,21 +544,25 @@ def _load_catalog(
     return product, asset
 
 
-def _publish_reserved_gauge(conn: psycopg.Connection[Any], chain_id: int) -> None:
-    """Set ``notchstave_active_reserved_addresses{chain}`` from the ledger.
-
-    Counted rather than incremented. A counter kept in process memory drifts the
-    moment an invoice expires in the settler or a second issuing process starts,
-    and this gauge carries the T5 alert at 80% of the ceiling — a drifting value
-    there either cries wolf or, worse, stays quiet during the burst it exists to
-    catch. One cheap indexed count per issuance is the right price for a number
-    an alert depends on.
-    """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(SQL_COUNT_RESERVED_ON_CHAIN, {"chain_id": chain_id, "live": list(_LIVE)})
-        row = cur.fetchone()
-    if row is not None:
-        ACTIVE_RESERVED_ADDRESSES.labels(chain=str(chain_id)).set(float(row["n"]))
+# `notchstave_active_reserved_addresses` used to be written here, once per
+# issuance, and the Week-5 review established that the number it produced was
+# not the number TZ 5.8/T5.2's alert is written against:
+#
+# * it counted **live invoices** on a chain, which is not the same quantity as
+#   reserved addresses — an invoice can be live against an address that was
+#   already latched `funded`, and the alert is about the address ceiling in
+#   `hd_accounts.max_active_addresses`;
+# * it only ever moved *up*, because issuance is the only event this module
+#   sees. Every event that lowers the number — an expiry, a settlement, an
+#   address returning to the pool — happens in the settler;
+# * and it ran inside the deriver process, which by design runs no `/metrics`
+#   server at all (`deriver/tests/test_isolation.py` fails the build if it grows
+#   one), so the value went into a registry nothing has ever scraped.
+#
+# The family now has exactly one writer, in the one process that can compute the
+# real figure and have it collected: `settler.service
+# .publish_reserved_address_gauge`, on the settler's own pass, from a `SELECT`
+# over `receive_addresses`.
 
 
 def create_invoice(
@@ -753,7 +749,6 @@ def create_invoice(
         )
 
     INVOICES_CREATED.labels(chain=str(chain_id), asset=asset["symbol"]).inc()
-    _publish_reserved_gauge(conn, chain_id)
 
     return InvoiceView(
         invoice_id=invoice_id,

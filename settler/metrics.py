@@ -34,6 +34,7 @@ __all__ = [
     "ORPHAN_PAYMENTS",
     "UNASSIGNED_PAYMENTS",
     "MAC_FAILURES",
+    "ACTIVE_RESERVED_ADDRESSES",
     "MANUAL_REVIEW_OPEN",
     "PAYMENT_CREDIT_SECONDS",
     "RECONCILE_DRIFT_USD",
@@ -77,6 +78,19 @@ UNASSIGNED_PAYMENTS = core_metrics.unassigned_payments_total
 #: existed the settlement checkpoint the TZ asks for was not implemented at all.
 #: Same family, one declaration site, three callers.
 MAC_FAILURES = core_metrics.invoice_mac_failures_total
+
+#: TZ 5.8/T5.2 — how much of the derivation account's ceiling is in use, with
+#: the alert at 80%.
+#:
+#: The settler is now this family's **only** writer. It used to have two, and
+#: neither reported the quantity the alert is written against: the invoicing
+#: service counted live invoices (a different number) from inside the deriver
+#: process, which runs no exporter at all, and the watcher counted entries in
+#: the ``eth_getLogs`` filter it was about to build. The settler holds SELECT on
+#: ``receive_addresses`` and already serves ``/metrics``, so it is the one
+#: process that can compute the real number *and* have it scraped. See
+#: :func:`settler.service.publish_reserved_address_gauge`.
+ACTIVE_RESERVED_ADDRESSES = core_metrics.active_reserved_addresses
 
 MANUAL_REVIEW_OPEN = Gauge(
     "notchstave_manual_review_open",

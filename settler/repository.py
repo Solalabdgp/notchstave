@@ -82,6 +82,15 @@ __all__ = [
     "ENTITLEMENTS_ACTIVE_UNIQ",
     "SQL_CREDIT_INTERNAL_BALANCE",
     "SQL_EXPIRE_INVOICE_PAST_RATE_LOCK",
+    "CHANNEL_ADDRESS_LIFECYCLE",
+    "SQL_ADDRESSES_NEEDING_FUNDED_LATCH",
+    "SQL_ADDRESSES_READY_FOR_RELEASE",
+    "SQL_ENQUEUE_ADDRESS_REQUEST",
+    "SQL_RESERVED_ADDRESSES_BY_CHAIN",
+    "addresses_needing_funded_latch",
+    "addresses_ready_for_release",
+    "enqueue_address_request",
+    "reserved_addresses_by_chain",
 ]
 
 #: The partial unique index that is the real defence against a double grant
@@ -1276,3 +1285,219 @@ async def expire_invoice_past_rate_lock(
         {"invoice_id": invoice_id, "expected": list(expected)},
     )
     return result.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
+# The address pool: what the settler knows and the deriver has to be told
+# ---------------------------------------------------------------------------
+#
+# TZ 5.1 p. 2 gives three conditions for an address returning to the free pool,
+# and every one of them is a question about money and time:
+#
+#   1. it must never have held funds (`ever_funded`, a one-way latch);
+#   2. the top-up window plus a cooldown must have passed;
+#   3. the invoice that reserved it must be finished with it.
+#
+# The settler is the process that can answer all three — it owns `invoices` and
+# `payments` (TZ section 4) — and it is the only process that moves an invoice
+# into `expired` / `manual_review` / a settled status, which is the moment the
+# answers change. It also holds **SELECT and nothing else** on
+# `receive_addresses` (migration 0002, TZ 5.8/T1.2), which is why the two
+# statements below produce *requests* rather than UPDATEs.
+#
+# Both candidate queries are written so that a row stops matching once the
+# deriver has acted on it — `cooldown_until` becomes non-NULL, or `ever_funded`
+# becomes true. That is what makes this a sweep over database state in the same
+# sense as every other settler pass: it is safe to run on every tick, it is safe
+# to lose a request, and it converges without anybody tracking what has already
+# been asked.
+
+#: Channel from migration 0011. Mirrored in ``deriver/requests.py``; the trigger
+#: does the notifying, so this constant exists for the test that asserts the
+#: copies have not drifted.
+CHANNEL_ADDRESS_LIFECYCLE = "notchstave_address_lifecycle"
+
+#: Addresses that have seen money and are not yet latched out of the pool.
+#:
+#: ``free`` is in the status filter alongside ``reserved`` on purpose. An
+#: address that received a transfer while sitting in the pool — an
+#: ``unassigned_payment``, TZ 5.5 — is the single most dangerous row in this
+#: table: it holds real money and is first in line to be handed to the next
+#: buyer, who would then be shown an address with a stranger's balance on it.
+#:
+#: ``reverted`` is the one payment status excluded. Money in a reorged-out block
+#: provably stopped existing (TZ 5.4), and if it comes back the watcher writes a
+#: fresh row in a live status which matches this query on the very next pass.
+#: ``ignored_dust`` is *included*: dust is still somebody's money sitting on the
+#: address, and the reuse rule is about the address's history, not about whether
+#: the amount was worth crediting.
+SQL_ADDRESSES_NEEDING_FUNDED_LATCH = sa.text(
+    """
+    SELECT ra.id                 AS address_id,
+           ra.current_invoice_id AS invoice_id
+      FROM receive_addresses ra
+     WHERE ra.status IN ('free', 'reserved')
+       AND NOT ra.ever_funded
+       AND EXISTS (
+               SELECT 1
+                 FROM payments p
+                WHERE p.address_id = ra.id
+                  AND p.status::text <> 'reverted'
+           )
+       AND NOT EXISTS (
+               SELECT 1
+                 FROM address_lifecycle_requests r
+                WHERE r.address_id = ra.id
+                  AND r.action = 'mark_funded'
+                  AND r.status IN ('pending', 'processing')
+           )
+     ORDER BY ra.id
+     LIMIT :limit
+    """
+)
+
+#: Addresses whose tenant is gone and which never held a coin.
+#:
+#: ``cooldown_until`` is computed here, in SQL, for the reason every other
+#: timestamp in this module is: twenty workers on three hosts do not agree on
+#: what time it is, and a cooldown that ends at a different instant per worker
+#: is a bug that only shows up under load. ``GREATEST(topup_window_until,
+#: now())`` because an invoice can reach a terminal status long before its
+#: window closes — a cancellation, an expired rate lock — and the window is the
+#: floor, not the start.
+#:
+#: The ``NOT EXISTS`` on ``payments`` is condition 1 restated in the form that
+#: catches it earliest: ``ever_funded`` is set by the deriver on a request from
+#: the *other* statement above, and between a payment landing and that request
+#: being served there is a window in which the flag is still false. Asking
+#: ``payments`` directly closes it, so the two sweeps cannot race into freeing
+#: an address that has money on it.
+SQL_ADDRESSES_READY_FOR_RELEASE = sa.text(
+    """
+    SELECT ra.id                 AS address_id,
+           ra.current_invoice_id AS invoice_id,
+           GREATEST(i.topup_window_until, now())
+               + make_interval(secs => :cooldown_seconds) AS cooldown_until
+      FROM receive_addresses ra
+      JOIN invoices i ON i.id = ra.current_invoice_id
+     WHERE ra.status = 'reserved'
+       AND NOT ra.ever_funded
+       AND ra.cooldown_until IS NULL
+       AND i.status::text <> ALL(:live_statuses)
+       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.address_id = ra.id)
+       AND NOT EXISTS (
+               SELECT 1
+                 FROM address_lifecycle_requests r
+                WHERE r.address_id = ra.id
+                  AND r.action = 'release'
+                  AND r.status IN ('pending', 'processing')
+           )
+     ORDER BY ra.id
+     LIMIT :limit
+    """
+).bindparams(sa.bindparam("live_statuses", type_=_TEXT_ARRAY))
+
+#: ``ON CONFLICT DO NOTHING`` with no target, which covers every constraint on
+#: the table and in practice means ``uq_address_lifecycle_open_per_action``. The
+#: candidate queries above already exclude open requests; this is the guard for
+#: the gap between their SELECT and this INSERT, which two settler workers on
+#: the same pass will find.
+SQL_ENQUEUE_ADDRESS_REQUEST = sa.text(
+    """
+    INSERT INTO address_lifecycle_requests
+           (id, address_id, invoice_id, action, cooldown_until)
+    VALUES (:request_id, :address_id, :invoice_id,
+            CAST(:action AS address_lifecycle_action), :cooldown_until)
+    ON CONFLICT DO NOTHING
+    RETURNING id
+    """
+)
+
+#: The real number behind ``notchstave_active_reserved_addresses`` (TZ 5.8/T5.2).
+#:
+#: Grouped by the chain of the *invoice*, because a receive address is
+#: chain-agnostic — the same key derives the same address on every EVM network,
+#: which is exactly why ``wrong_chain`` exists (TZ 5.5) — so "reserved on chain
+#: X" can only mean "reserved by an invoice denominated on chain X".
+SQL_RESERVED_ADDRESSES_BY_CHAIN = sa.text(
+    """
+    SELECT i.chain_id AS chain_id, count(*) AS reserved
+      FROM receive_addresses ra
+      JOIN invoices i ON i.id = ra.current_invoice_id
+     WHERE ra.status = 'reserved'
+     GROUP BY i.chain_id
+    """
+)
+
+SQL_ENABLED_CHAIN_IDS = sa.text(
+    "SELECT chain_id FROM chains WHERE is_enabled ORDER BY chain_id"
+)
+
+
+async def addresses_needing_funded_latch(
+    conn: AsyncConnection, *, limit: int = 500
+) -> list[dict[str, Any]]:
+    rows = (
+        await conn.execute(SQL_ADDRESSES_NEEDING_FUNDED_LATCH, {"limit": limit})
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+async def addresses_ready_for_release(
+    conn: AsyncConnection,
+    *,
+    live_statuses: tuple[str, ...],
+    cooldown_seconds: float,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    rows = (
+        await conn.execute(
+            SQL_ADDRESSES_READY_FOR_RELEASE,
+            {
+                "live_statuses": list(live_statuses),
+                "cooldown_seconds": float(cooldown_seconds),
+                "limit": limit,
+            },
+        )
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+async def enqueue_address_request(
+    conn: AsyncConnection,
+    *,
+    request_id: uuid.UUID,
+    address_id: int,
+    invoice_id: uuid.UUID | None,
+    action: str,
+    cooldown_until: dt.datetime | None,
+) -> uuid.UUID | None:
+    """Ask the deriver for one address transition. ``None`` means already asked."""
+    row = (
+        await conn.execute(
+            SQL_ENQUEUE_ADDRESS_REQUEST,
+            {
+                "request_id": request_id,
+                "address_id": address_id,
+                "invoice_id": invoice_id,
+                "action": action,
+                "cooldown_until": cooldown_until,
+            },
+        )
+    ).first()
+    return None if row is None else request_id
+
+
+async def reserved_addresses_by_chain(conn: AsyncConnection) -> dict[int, int]:
+    """Reserved-address count per chain, zero-filled for every enabled chain.
+
+    The zero fill is the half that matters. A gauge that is only written when
+    the number is non-zero keeps reporting the last value it saw, so a chain
+    whose invoices have all settled looks permanently busy — and the T5 alert
+    fires at 80% of a ceiling, which is precisely the kind of number that has to
+    be able to come back down.
+    """
+    counts = {int(r[0]): 0 for r in (await conn.execute(SQL_ENABLED_CHAIN_IDS)).all()}
+    for row in (await conn.execute(SQL_RESERVED_ADDRESSES_BY_CHAIN)).mappings().all():
+        counts[int(row["chain_id"])] = int(row["reserved"])
+    return counts

@@ -78,6 +78,7 @@ __all__ = [
     "release_due_addresses",
     "mark_address_funded",
     "verify_stored_address",
+    "hd_account_ids",
 ]
 
 
@@ -271,6 +272,16 @@ UPDATE receive_addresses
    AND status IN ('free', 'reserved', 'funded')
 RETURNING id, derivation_index, address, ever_funded
 """
+
+#: Every derivation account, active or not. Not filtered on ``is_active``, and
+#: that is deliberate: :func:`release_due_addresses` is keyed per account and an
+#: account taken out of service mid-rotation (TZ 5.8/T4) still has reserved
+#: addresses on it whose invoices are finished. Leaving those pinned forever
+#: would make a rotation a permanent leak of index space on the old account —
+#: small, but exactly the kind of "it only happens once" that nobody notices for
+#: a year. The release predicate is identical either way, so including inactive
+#: accounts costs one no-op statement per sweep and closes the case.
+SQL_ALL_HD_ACCOUNT_IDS = "SELECT id FROM hd_accounts ORDER BY id"
 
 SQL_SELECT_ADDRESS_ROW = """
 SELECT id, hd_account_id, derivation_index, address, status
@@ -517,6 +528,19 @@ def mark_address_funded(conn: psycopg.Connection[Any], address_id: int) -> bool:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(SQL_MARK_FUNDED, {"address_id": address_id})
         return cur.fetchone() is not None
+
+
+def hd_account_ids(conn: psycopg.Connection[Any]) -> list[int]:
+    """Every derivation account id, so a sweep can visit all of them.
+
+    :func:`release_due_addresses` takes one account at a time — its statement is
+    keyed on ``hd_account_id`` so that a release pass touches one account's rows
+    and cannot lock the whole table. Somebody has to enumerate them, and the
+    deriver is the process that owns this table's writes anyway.
+    """
+    with conn.cursor() as cur:
+        cur.execute(SQL_ALL_HD_ACCOUNT_IDS)
+        return [int(row[0]) for row in cur.fetchall()]
 
 
 def verify_stored_address(

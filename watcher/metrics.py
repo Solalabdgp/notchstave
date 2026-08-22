@@ -10,7 +10,6 @@ alert rules and the Grafana dashboard in TZ section 7 refer to them by name:
     notchstave_reorgs_total{chain,depth}
     notchstave_payment_detect_seconds                block timestamp -> row in DB
     notchstave_getlogs_filter_size{chain}            TZ 5.8/T5 early warning
-    notchstave_active_reserved_addresses{chain}
     notchstave_orphan_payments_total{chain}
     notchstave_unassigned_payments_total{chain}
 
@@ -48,7 +47,6 @@ __all__ = [
     "reorgs_total",
     "payment_detect_seconds",
     "getlogs_filter_size",
-    "active_reserved_addresses",
     "orphan_payments_total",
     "unassigned_payments_total",
     "breaker_state",
@@ -135,18 +133,23 @@ getlogs_filter_size = Gauge(
     ["chain"],
 )
 
-# Re-exported, not re-declared. These families are written by the watcher (which
-# classifies the anomaly, and which counts the addresses going into its filter)
-# and by another process that observes the same fact from the other side — the
-# settler, which opens the manual-review case, and the invoicing service, which
-# is what makes an address reserved in the first place. The docstring at the top
-# of this module is the reason that has to be one collector rather than two: a
-# name claimed twice raises DuplicateTimeseries the moment a single process
-# imports both packages, which is exactly what `/reconcile` does since it reuses
-# this package's RPC pool. See core/metrics.py.
+# Re-exported, not re-declared. The watcher classifies the anomaly from the
+# block; the settler turns that classification into a case a human reads, and TZ
+# section 7's alert is about the second event. The docstring at the top of this
+# module is the reason that has to be one collector rather than two: a name
+# claimed twice raises DuplicateTimeseries the moment a single process imports
+# both packages, which is exactly what `/reconcile` does since it reuses this
+# package's RPC pool. See core/metrics.py.
 orphan_payments_total = core_metrics.orphan_payments_total
 unassigned_payments_total = core_metrics.unassigned_payments_total
-active_reserved_addresses = core_metrics.active_reserved_addresses
+
+# `active_reserved_addresses` is deliberately *not* aliased here any more. The
+# watcher used to set it from the size of its own address filter, which made it
+# the second exporter of a family whose real source is the `receive_addresses`
+# table — two Prometheus series under two `job` labels for one quantity. Its
+# single writer is now `settler.service.publish_reserved_address_gauge`. The
+# family itself still lives in core/metrics.py; nothing in this package touches
+# it.
 
 breaker_state = Gauge(
     "notchstave_rpc_breaker_state",

@@ -613,9 +613,20 @@ class ChainWalker:
             )
 
     def _publish_filter_metrics(self, addresses: Sequence[WatchedAddress]) -> None:
+        """How big the ``eth_getLogs`` filter is — TZ 5.8/T5's early warning.
+
+        This used to also set ``notchstave_active_reserved_addresses`` from the
+        same list, by counting the entries whose priority marks them reserved.
+        That reading was one pass behind the ledger, shaped by the filter's own
+        priority rules rather than by ``receive_addresses``, and — because it was
+        one of two processes exporting the family — produced a second Prometheus
+        series under a different ``job`` that any dashboard summing the metric
+        double-counted. The settler owns that gauge now: it holds SELECT on
+        ``receive_addresses``, it already serves ``/metrics``, and it counts the
+        rows rather than inferring them (``settler.service
+        .publish_reserved_address_gauge``).
+        """
         metrics.getlogs_filter_size.labels(chain=self._chain_label).set(len(addresses))
-        reserved = sum(1 for address in addresses if address.priority <= 1)
-        metrics.active_reserved_addresses.labels(chain=self._chain_label).set(reserved)
 
 
 async def rewalk_after_reorg(

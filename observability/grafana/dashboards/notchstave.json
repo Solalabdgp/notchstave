@@ -328,7 +328,7 @@
       "id": 36,
       "type": "timeseries",
       "title": "Active reserved addresses (T5 gap-limit pressure)",
-      "description": "notchstave_active_reserved_addresses{chain} — compare against hd_accounts.max_active_addresses, not exported as a metric yet (see alerts.yml header).",
+      "description": "notchstave_active_reserved_addresses{chain} — counted from receive_addresses by the settler on every pass, and by nothing else. Compare against hd_accounts.max_active_addresses, which is still not exported as a metric (see alerts.yml header).",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 54 },
       "datasource": { "type": "prometheus", "uid": "notchstave-prometheus" },
       "targets": [

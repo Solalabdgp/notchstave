@@ -91,6 +91,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from core.db import enums as E
+from core.invoicing.ids import uuid7
 from core.invoicing.integrity import IntegrityKey, load_integrity_key, verify_mac
 from settler import metrics
 from settler import repository as repo
@@ -117,6 +118,9 @@ __all__ = [
     "expire_stale_invoices",
     "review_anomalous_payments",
     "notify_seen_payments",
+    "sync_address_lifecycle",
+    "publish_reserved_address_gauge",
+    "DEFAULT_ADDRESS_COOLDOWN",
     "LIVE_INVOICE_STATUSES",
     "SETTLED_INVOICE_STATUSES",
     "CREDITABLE_PAYMENT_STATUSES",
@@ -1401,6 +1405,126 @@ async def notify_seen_payments(
     return tuple(notified)
 
 
+#: How long after the top-up window an address stays out of the pool before it
+#: may be handed to somebody else (TZ 5.1 p. 2, condition 2).
+#:
+#: An hour, and the number is a judgement about human behaviour rather than
+#: about the chain: the failure it guards against is a buyer who sends the money
+#: late — after the window closed, after the invoice expired — to an address they
+#: copied out of a Telegram message yesterday. If that address already belongs
+#: to a stranger's invoice, their payment credits the stranger. The chain-level
+#: half of that protection is ``reserved_from_block`` (condition 3), which turns
+#: such a transfer into an ``orphan_payment`` rather than a credit; the cooldown
+#: is the part that keeps the two tenancies apart in *time* so the anomaly is
+#: rare instead of routine.
+DEFAULT_ADDRESS_COOLDOWN = dt.timedelta(hours=1)
+
+
+async def sync_address_lifecycle(
+    conn: AsyncConnection,
+    *,
+    cooldown: dt.timedelta = DEFAULT_ADDRESS_COOLDOWN,
+    limit: int = 500,
+) -> tuple[int, int]:
+    """Ask the deriver to move every address whose situation has changed.
+
+    Returns ``(latched, released)`` — how many ``mark_funded`` and how many
+    ``release`` requests this pass enqueued.
+
+    **Why this exists at all.** ``deriver/pool.py`` has shipped the entire return
+    path since Week 1 and nothing ever called it. ``create_invoice`` takes an
+    address out of the pool; no code put one back; so
+    ``hd_accounts.max_active_addresses`` — documented as a ceiling on
+    *simultaneously* reserved addresses — behaved as a lifetime issuance cap that
+    a successful shop reaches in days, after which every ``/buy`` is refused and
+    nothing recovers on its own.
+
+    **Why it is a sweep and not a hook on the transition.** Putting an enqueue
+    next to each place an invoice stops being live — ``_apply_settlement``,
+    ``sweep_expired_invoices``, ``expire_stale_invoices``, ``handle_reorg`` and
+    ``settler.admin.reviews`` — would be four or five call sites that must all
+    remember, and the sixth one added next year would leak addresses silently for
+    however long it took somebody to notice a number that only moves over weeks.
+    A sweep re-derives the answer from ``receive_addresses`` / ``invoices`` /
+    ``payments`` every pass, which is the same stance the rest of this module
+    takes (TZ 5.3: the settled total is a SUM, never a counter) and which
+    recovers by construction from a request that was lost, abandoned or issued
+    against a deployment whose deriver was down.
+
+    **Two directions, and only one of them is reversible.** ``mark_funded`` is a
+    one-way latch: an address that has held money never returns to the pool, and
+    that request is issued for anything with a non-``reverted`` payment against
+    it — including an address still sitting ``free``, which is the
+    ``unassigned_payment`` case and the most dangerous row in the table.
+    ``release`` is scheduled rather than applied: it writes ``cooldown_until``,
+    and the address becomes free only when the deriver's own pass finds all
+    three TZ 5.1 conditions satisfied (``deriver.pool.SQL_RELEASE_DUE``).
+
+    No audit row and no notification. Nothing here is a money decision or an
+    owner action (TZ 5.8/T8) — it is address hygiene, and the queue row plus the
+    deriver's log is the record.
+    """
+    latched = 0
+    for row in await repo.addresses_needing_funded_latch(conn, limit=limit):
+        request_id = await repo.enqueue_address_request(
+            conn,
+            request_id=uuid7(dt.datetime.now(dt.UTC)),
+            address_id=int(row["address_id"]),
+            invoice_id=row["invoice_id"],
+            action="mark_funded",
+            cooldown_until=None,
+        )
+        if request_id is not None:
+            latched += 1
+
+    released = 0
+    for row in await repo.addresses_ready_for_release(
+        conn,
+        live_statuses=LIVE_INVOICE_STATUSES,
+        cooldown_seconds=cooldown.total_seconds(),
+        limit=limit,
+    ):
+        request_id = await repo.enqueue_address_request(
+            conn,
+            request_id=uuid7(dt.datetime.now(dt.UTC)),
+            address_id=int(row["address_id"]),
+            invoice_id=row["invoice_id"],
+            action="release",
+            cooldown_until=row["cooldown_until"],
+        )
+        if request_id is not None:
+            released += 1
+
+    return latched, released
+
+
+async def publish_reserved_address_gauge(conn: AsyncConnection) -> dict[int, int]:
+    """Set ``notchstave_active_reserved_addresses{chain}`` from the ledger.
+
+    The family had two writers and neither produced the number the TZ section 7
+    alert (80% of ``max_active_addresses``) is written against:
+
+    * ``core.invoicing.service`` counted **live invoices** on a chain, not
+      reserved addresses — a different quantity — and did it inside the deriver
+      process, which by design runs no ``/metrics`` server, so the value went
+      into a registry nothing ever scraped;
+    * ``watcher.traversal`` counted entries in the ``eth_getLogs`` filter it was
+      about to build, which is a view of the same thing one pass behind and
+      shaped by the filter's own priority rules.
+
+    The settler has both halves: a ``SELECT`` on ``receive_addresses`` and an
+    exporter that Prometheus already scrapes (``settler.metrics.start_exporter``,
+    wired in :func:`settler.main.main`). One writer, one query, one meaning.
+
+    Called from the same pass that enqueues the pool transitions above, so the
+    gauge and the mechanism that moves it can never be deployed apart.
+    """
+    counts = await repo.reserved_addresses_by_chain(conn)
+    for chain_id, reserved in counts.items():
+        metrics.ACTIVE_RESERVED_ADDRESSES.labels(chain=str(chain_id)).set(float(reserved))
+    return counts
+
+
 async def review_anomalous_payments(
     conn: AsyncConnection,
     *,
@@ -1462,9 +1586,16 @@ class Settler:
         lock: InvoiceLock | None = None,
         actor_id: str = _ACTOR_ID,
         integrity_key: IntegrityKey | None = None,
+        address_cooldown: dt.timedelta = DEFAULT_ADDRESS_COOLDOWN,
     ) -> None:
         self._engine = engine
         self._policy = policy
+        #: Not a field of :class:`~settler.policy.MoneyPolicy`, deliberately.
+        #: That dataclass carries the TZ 5.5 thresholds and its ``version`` is
+        #: written into every audit row, so adding a knob to it would force a
+        #: policy-version bump for a number that decides nothing about money.
+        #: This one decides how long an address rests, which is hygiene.
+        self._address_cooldown = address_cooldown
         #: Default is no lock at all. Redis is an optimisation and the system
         #: must be correct without it (TZ 5.8/T2.4).
         self._lock: InvoiceLock = lock or NullLock()
@@ -1522,3 +1653,15 @@ class Settler:
     async def review_anomalies(self) -> tuple[int, ...]:
         async with self._engine.begin() as conn:
             return await review_anomalous_payments(conn, policy=self._policy)
+
+    async def sync_addresses(self) -> tuple[int, int]:
+        """Enqueue the pool transitions and refresh the gauge, in one transaction.
+
+        Together on purpose: the count the gauge reports and the requests that
+        will change it are read from one snapshot, so a dashboard cannot show a
+        number that never existed.
+        """
+        async with self._engine.begin() as conn:
+            moved = await sync_address_lifecycle(conn, cooldown=self._address_cooldown)
+            await publish_reserved_address_gauge(conn)
+            return moved

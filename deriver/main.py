@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 
 import psycopg
 
+from deriver import pool
 from deriver.pool import AddressDeriver
 from deriver.redaction import install as install_redaction
 from deriver.requests import (
@@ -57,6 +58,7 @@ from deriver.requests import (
     DEFAULT_RETENTION_SECONDS,
     PROOF_ABANDONED_ERROR_CODE,
     PROOF_ABANDONED_USER_MESSAGE,
+    AddressLifecycleRequest,
     InvoiceIssuer,
     InvoiceRequest,
     ProofIssuer,
@@ -64,18 +66,25 @@ from deriver.requests import (
     RefusedInvoice,
     RefusedProof,
     complete,
+    complete_address_request,
     complete_proof,
     drain,
+    drain_address_requests,
     drain_proofs,
+    listen_for_address_lifecycle,
     listen_for_proofs,
     listen_for_requests,
     prune_completed,
+    prune_completed_address_requests,
     prune_completed_proofs,
     reclaim_stale,
+    reclaim_stale_address_requests,
     reclaim_stale_proofs,
     refuse,
+    refuse_address_request,
     refuse_proof,
     requeue,
+    requeue_address_request,
     requeue_proof,
     wait_for_request,
 )
@@ -88,10 +97,14 @@ __all__ = [
     "serve",
     "serve_one",
     "serve_one_proof",
+    "serve_one_address_request",
     "run_once",
     "run_once_proofs",
+    "run_once_address_requests",
+    "release_due_everywhere",
     "housekeeping",
     "housekeeping_proofs",
+    "housekeeping_address_requests",
     "database_dsn",
     "main",
     "DEFAULT_POLL_INTERVAL_SECONDS",
@@ -328,6 +341,131 @@ def serve_one_proof(
     return "proven"
 
 
+def serve_one_address_request(
+    conn: psycopg.Connection[Any],
+    request: AddressLifecycleRequest,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> str:
+    """Apply one address transition the settler asked for (migration 0011).
+
+    Returns ``applied`` / ``noop`` / ``refused`` / ``retry`` / ``abandoned`` /
+    ``lease_lost``.
+
+    No issuer port here, unlike :func:`serve_one` and :func:`serve_one_proof`:
+    the work is two statements in :mod:`deriver.pool`, both of them in this
+    package, neither of them needing anything from ``core``. Injecting a
+    callable to reach code that is already importable would be ceremony.
+
+    **``noop`` is a success, not a silence.** ``schedule_release`` returns False
+    when the address is no longer ``reserved`` and ``mark_address_funded``
+    returns False when it is in a status the latch does not cover. Both mean the
+    world moved on between the settler's sweep and this pass — an invoice paid,
+    an address already latched — and the correct answer is to close the request,
+    not to retry it three times and then declare a failure. The settler's next
+    sweep re-derives the truth from the ledger either way.
+
+    A genuinely unknown ``action`` is refused rather than ignored. It can only
+    arrive from a deployment where the enum grew a value this binary does not
+    know, and quietly marking such a row ``done`` would report success for work
+    that never happened.
+    """
+    try:
+        if request.action == "release":
+            if request.cooldown_until is None:  # pragma: no cover - CHECK forbids it
+                raise ValueError("release request without a cooldown_until")
+            changed = pool.schedule_release(conn, request.address_id, request.cooldown_until)
+        elif request.action == "mark_funded":
+            changed = pool.mark_address_funded(conn, request.address_id)
+        else:
+            conn.rollback()
+            refuse_address_request(
+                conn,
+                request.request_id,
+                error_code="UnknownAddressAction",
+                error_message=f"this deriver does not implement action {request.action!r}",
+            )
+            conn.commit()
+            logger.error(
+                "address request %s asks for unknown action %r",
+                request.request_id,
+                request.action,
+            )
+            return "refused"
+    except Exception:
+        # Same boundary as serve_one: one bad request must not take down the
+        # process every other request is queued behind.
+        conn.rollback()
+        logger.exception(
+            "address request %s (%s on address %d) failed on attempt %d",
+            request.request_id,
+            request.action,
+            request.address_id,
+            request.attempts,
+        )
+        if requeue_address_request(conn, request.request_id, max_attempts=max_attempts):
+            conn.commit()
+            return "retry"
+        refuse_address_request(
+            conn,
+            request.request_id,
+            error_code="AddressLifecycleFailed",
+            error_message="the transition raised on every attempt; see the deriver log",
+        )
+        conn.commit()
+        return "abandoned"
+
+    if not complete_address_request(conn, request.request_id):
+        conn.rollback()
+        logger.error(
+            "address request %s: lease lost mid-transition, rolled back", request.request_id
+        )
+        return "lease_lost"
+
+    conn.commit()
+    logger.info(
+        "address request %s: %s on address %d -> %s",
+        request.request_id,
+        request.action,
+        request.address_id,
+        "applied" if changed else "already in that state",
+    )
+    return "applied" if changed else "noop"
+
+
+def release_due_everywhere(conn: psycopg.Connection[Any]) -> int:
+    """Return every address that now satisfies all three TZ 5.1 conditions.
+
+    The second half of the release path, and the half nothing asks for: a
+    ``release`` request only writes ``cooldown_until``, because condition 2 is a
+    *deadline* and the address is not returnable until it passes. Somebody has
+    to come back later, and this is that somebody.
+
+    Run on the idle tick rather than per request. The predicate is
+    time-dependent, so running it more often than the poll interval finds
+    nothing new, and running it per request would make a burst of expiries scan
+    the table once each.
+
+    All three conditions stay in ``deriver.pool.SQL_RELEASE_DUE``'s WHERE clause
+    and are deliberately not restated here — see that statement's comment for
+    why a caller must not be able to release an address by taking a different
+    code path.
+    """
+    released = 0
+    for hd_account_id in pool.hd_account_ids(conn):
+        freed = pool.release_due_addresses(conn, hd_account_id)
+        released += len(freed)
+        if freed:
+            logger.info(
+                "returned %d address(es) to the free pool on hd_account_id=%d: %s",
+                len(freed),
+                hd_account_id,
+                [a.derivation_index for a in freed],
+            )
+    conn.commit()
+    return released
+
+
 def run_once(
     conn: psycopg.Connection[Any],
     deriver: AddressDeriver,
@@ -358,6 +496,18 @@ def run_once_proofs(
     return [
         serve_one_proof(conn, deriver, issuer, request, max_attempts=max_attempts)
         for request in drain_proofs(conn)
+    ]
+
+
+def run_once_address_requests(
+    conn: psycopg.Connection[Any],
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> list[str]:
+    """Drain the address-lifecycle queue. One outcome label per request."""
+    return [
+        serve_one_address_request(conn, request, max_attempts=max_attempts)
+        for request in drain_address_requests(conn)
     ]
 
 
@@ -401,6 +551,34 @@ def housekeeping_proofs(
     )
     pruned = prune_completed_proofs(conn, retention_seconds=retention_seconds)
     conn.commit()
+    return requeued, abandoned, pruned
+
+
+def housekeeping_address_requests(
+    conn: psycopg.Connection[Any],
+    *,
+    lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retention_seconds: float = DEFAULT_RETENTION_SECONDS,
+) -> tuple[int, int, int]:
+    """The same sweep for the lifecycle queue, plus the due-release pass.
+
+    The extra step is why this is not a third copy of the two above: releasing
+    an address whose cooldown has expired is a scheduled job with no queue row
+    behind it (see :func:`release_due_everywhere`), and the idle tick is exactly
+    where it belongs. Bundling it here rather than giving it its own timer keeps
+    the loop in :func:`serve` to one shape.
+
+    Unlike :func:`housekeeping_proofs`, this always runs — there is no optional
+    port to gate it on, and a deployment whose settler is newer than its deriver
+    would otherwise fill the queue with rows nobody ever answers.
+    """
+    requeued, abandoned = reclaim_stale_address_requests(
+        conn, lease_seconds=lease_seconds, max_attempts=max_attempts
+    )
+    pruned = prune_completed_address_requests(conn, retention_seconds=retention_seconds)
+    conn.commit()
+    release_due_everywhere(conn)
     return requeued, abandoned, pruned
 
 
@@ -457,13 +635,20 @@ def serve(
     A single-connection version is deaf for exactly the window in which requests
     pile up, which is the window that matters.
 
-    **One listener for both queues.** The second ``LISTEN`` goes on the same
-    connection, so a wakeup from either channel ends the wait and the pass then
-    drains both. That is strictly better than two waits: a notification is only
-    ever a hint here (the pass re-reads regardless), so the cost of being woken
-    by the other queue is one empty claim, and the alternative — a second
-    connection parked on a second wait — would double the idle connections of a
+    **One listener for all three queues.** Every ``LISTEN`` goes on the same
+    connection, so a wakeup from any channel ends the wait and the pass then
+    drains all of them. That is strictly better than three waits: a notification
+    is only ever a hint here (the pass re-reads regardless), so the cost of being
+    woken by another queue is one empty claim, and the alternative — a second
+    connection parked on a second wait — would multiply the idle connections of a
     process whose whole design story is that it holds exactly one outbound link.
+
+    The third queue is ``address_lifecycle_requests`` (migration 0011): the
+    settler handing a receive address back to the pool, or latching it out of it
+    for good. Unlike the two above it is not optional and takes no port — see
+    :func:`serve_one_address_request`. Its housekeeping also carries the
+    scheduled half of the return path (:func:`release_due_everywhere`), which is
+    the pass that actually refills the free pool.
 
     ``proof_issuer`` is optional so that the invoice queue keeps working on a
     deploy where 0008 has not been applied yet, and so that a test that cares
@@ -511,14 +696,22 @@ def serve(
                 max_attempts=max_attempts,
                 retention_seconds=retention_seconds,
             )
+        housekeeping_address_requests(
+            work_conn,
+            lease_seconds=lease_seconds,
+            max_attempts=max_attempts,
+            retention_seconds=retention_seconds,
+        )
 
     try:
         listen_for_requests(listen_conn)
         if proof_issuer is not None:
             listen_for_proofs(listen_conn)
+        listen_for_address_lifecycle(listen_conn)
         logger.info(
-            "deriver serving invoice requests%s (poll=%.1fs, lease=%.0fs)",
-            " and derivation proofs" if proof_issuer is not None else "",
+            "deriver serving invoice requests%s and address lifecycle "
+            "(poll=%.1fs, lease=%.0fs)",
+            ", derivation proofs" if proof_issuer is not None else "",
             poll_interval,
             lease_seconds,
         )
@@ -535,6 +728,7 @@ def serve(
                 outcomes += run_once_proofs(
                     work_conn, deriver, proof_issuer, max_attempts=max_attempts
                 )
+            outcomes += run_once_address_requests(work_conn, max_attempts=max_attempts)
             if outcomes:
                 logger.debug(
                     "pass served %d request(s) in %.0fms",

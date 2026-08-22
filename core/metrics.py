@@ -25,12 +25,17 @@ observation points explicitly: the address is re-derived and the MAC re-checked
 в settler"* — three call sites in three processes. A counter whose whole meaning
 is "somebody, somewhere, saw a tampered invoice" cannot be owned by one of them.
 
-``notchstave_active_reserved_addresses`` moved here for the same reason in Week
-5. The watcher sets it from the filter it is about to build; the invoicing
-service sets it the moment it takes an address out of the pool, which is the
-earlier and more actionable of the two readings — the T5 alert fires at 80% of
-the ceiling, and waiting for the next watcher pass to notice is a scrape
-interval of blindness during exactly the burst the alert is for.
+``notchstave_active_reserved_addresses`` is the odd one out and is the exception
+that proves the rule. It moved here in Week 5 because two processes were setting
+it — the watcher from the filter it was about to build, the invoicing service
+from a count of live invoices — and the Week-5 review established that *neither*
+number was the one TZ 5.8/T5.2's alert is written against, and that the
+invoicing service's copy went into the deriver process's registry, which nothing
+scrapes because that process serves no ``/metrics`` by design. Both writers are
+gone. The family stays declared here, and its one writer is
+:func:`settler.service.publish_reserved_address_gauge` — the settler holds
+SELECT on ``receive_addresses`` and is already scraped, so it is the only
+process that can produce the real figure *and* have it collected.
 
 Declaring the family twice does not merely produce two readings: it raises
 ``DuplicateTimeseries`` the instant one process imports both packages. That
@@ -141,9 +146,11 @@ invoice_mac_failures_total = Counter(
 #: at 80%, because the ceiling is what bounds the ``eth_getLogs`` filter and the
 #: damage in T5 is degraded payment detection, not disk.
 #:
-#: A Gauge with two writers in two processes (see the module docstring). Both
-#: report a count of reserved addresses; the invoicing service reports it at the
-#: moment the count changes, the watcher when it rebuilds its filter.
+#: Declared here rather than in ``settler/metrics.py`` even though the settler is
+#: its only writer: ``core.invoicing.metrics`` and ``watcher.metrics`` both still
+#: name it in their docstrings as the number their own metrics are read against,
+#: and a family that any of the three might import has to have one declaration
+#: site or the first process to import two of them raises ``DuplicateTimeseries``.
 active_reserved_addresses = Gauge(
     "notchstave_active_reserved_addresses",
     "Receive addresses currently reserved by a live invoice (TZ 5.8/T5.2).",

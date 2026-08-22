@@ -162,7 +162,7 @@ groups:
         annotations:
           summary: "An invoice's integrity_mac did not verify"
           tz_reason: "Строка инвойса изменена мимо приложения. Тот же класс, тот же порядок действий."
-          status: "Wired, currently unreachable — invoice HMAC verification is Week 5 scope (TZ section 11)."
+          status: "Live. Incremented by all three TZ 5.8/T1.3 checkpoints — bot before it sends an address, api when it renders the invoice page, and settler before it credits (settler/service.py::settle_invoice)."
 
       - alert: NotchstaveActiveReservedAddressesNearCeiling
         # Placeholder ratio — see file header. Replace 400 with the real
@@ -176,7 +176,7 @@ groups:
         annotations:
           summary: "Reserved address count on chain {{ $labels.chain }} is approaching the gap-limit ceiling"
           tz_reason: "Индексное пространство и фильтр watcher на исходе, вероятна атака на генерацию адресов (5.8/T5)."
-          status: "Approximated — compares against a fixed placeholder, not hd_accounts.max_active_addresses. See file header."
+          status: "Live, and approximated on one axis only. The series is now real — the settler counts rows in receive_addresses on every pass (settler/service.py::publish_reserved_address_gauge) and is its only writer, so this no longer sums two processes' different ideas of the number. The comparison is still against a fixed placeholder rather than hd_accounts.max_active_addresses; see file header."
 
       - alert: NotchstaveInvoiceRateLimitHits
         expr: increase(notchstave_invoice_ratelimit_hits_total[5m]) > 20

@@ -97,6 +97,18 @@ __all__ = [
     "reclaim_stale_proofs",
     "prune_completed_proofs",
     "drain_proofs",
+    "CHANNEL_ADDRESS_LIFECYCLE",
+    "AddressLifecycleRequest",
+    "listen_for_address_lifecycle",
+    "claim_next_address_request",
+    "complete_address_request",
+    "refuse_address_request",
+    "requeue_address_request",
+    "reclaim_stale_address_requests",
+    "prune_completed_address_requests",
+    "drain_address_requests",
+    "ADDRESS_REQUEST_ABANDONED_ERROR_CODE",
+    "ADDRESS_REQUEST_ABANDONED_MESSAGE",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_RETENTION_SECONDS",
@@ -122,6 +134,11 @@ REPLY_CHANNEL_PREFIX = "nsr_"
 #: else's load.
 CHANNEL_PROOFS = "notchstave_proof_requests"
 PROOF_REPLY_PREFIX = "nsp_"
+
+#: The third queue, added in migration 0011: the settler handing a receive
+#: address back. Unlike the two above it has **no reply prefix**, because nobody
+#: waits — see the bottom section of this module and 0011's docstring.
+CHANNEL_ADDRESS_LIFECYCLE = "notchstave_address_lifecycle"
 
 
 def reply_channel(request_id: uuid.UUID) -> str:
@@ -859,6 +876,279 @@ def drain_proofs(conn: psycopg.Connection[Any]) -> Iterator[ProofRequest]:
     attempted: list[uuid.UUID] = []
     while True:
         request = claim_next_proof(conn, exclude=attempted)
+        if request is None:
+            conn.rollback()
+            return
+        conn.commit()
+        attempted.append(request.request_id)
+        yield request
+
+
+# ---------------------------------------------------------------------------
+# The address-lifecycle queue (migration 0011)
+# ---------------------------------------------------------------------------
+#
+# The third instance of the same machine, and the one that runs the other way:
+# above, user-facing processes ask this one for something a buyer is waiting on.
+# Here the *settler* asks, nobody is waiting, and the request is a housekeeping
+# instruction — put this address back in the pool, or latch it out of the pool
+# forever.
+#
+# Three consequences follow from "nobody is waiting", and they are why this half
+# is shorter than the two above rather than a copy of them:
+#
+# * **No reply channel and no client.** The trigger in 0011 fires on INSERT only.
+#   There is no `complete()` that carries a result, because the result is the
+#   `receive_addresses` row itself and the settler can read that directly.
+# * **No issuer port.** The work is `deriver.pool.schedule_release` and
+#   `deriver.pool.mark_address_funded` — both live in this package, both are
+#   pure psycopg, and neither needs anything from `core`. So `deriver/main.py`
+#   performs it inline instead of being handed a callable.
+# * **A lost request costs a poll interval.** The settler's sweep re-derives its
+#   candidates from `receive_addresses`/`invoices`/`payments` every pass, so an
+#   abandoned row is re-asked rather than lost. That is what makes the
+#   three-attempt budget safe here: giving up is not the end of the story.
+
+
+@dataclass(frozen=True, slots=True)
+class AddressLifecycleRequest:
+    """One claimed row of ``address_lifecycle_requests``.
+
+    ``action`` is ``'release'`` or ``'mark_funded'`` and arrives as text out of
+    the enum. It is not turned into a Python enum here for the reason the whole
+    package avoids one: ``core.db.enums`` is where this project's enums live and
+    this package may not import it (``deriver/pyproject.toml``), so a local copy
+    would be a second definition of a vocabulary the database already owns. The
+    caller matches on the string and :func:`deriver.main.serve_one_address_request`
+    refuses an unknown one rather than falling through.
+    """
+
+    request_id: uuid.UUID
+    address_id: int
+    invoice_id: uuid.UUID | None
+    action: str
+    cooldown_until: dt.datetime | None
+    attempts: int
+    requested_at: dt.datetime
+
+
+SQL_CLAIM_NEXT_ADDRESS_REQUEST = """
+UPDATE address_lifecycle_requests AS r
+   SET status = 'processing',
+       attempts = r.attempts + 1,
+       claimed_at = now()
+ WHERE r.id = (
+           SELECT inner_r.id
+             FROM address_lifecycle_requests AS inner_r
+            WHERE inner_r.status = 'pending'
+              AND NOT (inner_r.id = ANY(%(exclude)s::uuid[]))
+            ORDER BY inner_r.requested_at
+              FOR UPDATE SKIP LOCKED
+            LIMIT 1
+       )
+RETURNING r.id, r.address_id, r.invoice_id, r.action::text AS action,
+          r.cooldown_until, r.attempts, r.requested_at
+"""
+
+SQL_COMPLETE_ADDRESS_REQUEST = """
+UPDATE address_lifecycle_requests
+   SET status = 'done',
+       completed_at = now()
+ WHERE id = %(request_id)s
+   AND status = 'processing'
+RETURNING id
+"""
+
+SQL_REFUSE_ADDRESS_REQUEST = """
+UPDATE address_lifecycle_requests
+   SET status = 'failed',
+       error_code = %(error_code)s,
+       error_message = %(error_message)s,
+       completed_at = now()
+ WHERE id = %(request_id)s
+   AND status = 'processing'
+RETURNING id
+"""
+
+SQL_REQUEUE_ADDRESS_REQUEST = """
+UPDATE address_lifecycle_requests
+   SET status = 'pending',
+       claimed_at = NULL
+ WHERE id = %(request_id)s
+   AND status = 'processing'
+   AND attempts < %(max_attempts)s
+RETURNING id, attempts
+"""
+
+SQL_RECLAIM_STALE_ADDRESS_REQUESTS = """
+UPDATE address_lifecycle_requests
+   SET status = 'pending',
+       claimed_at = NULL
+ WHERE status = 'processing'
+   AND claimed_at < now() - make_interval(secs => %(lease_seconds)s)
+   AND attempts < %(max_attempts)s
+RETURNING id
+"""
+
+SQL_ABANDON_STALE_ADDRESS_REQUESTS = """
+UPDATE address_lifecycle_requests
+   SET status = 'failed',
+       error_code = %(error_code)s,
+       error_message = %(error_message)s,
+       completed_at = now()
+ WHERE status = 'processing'
+   AND claimed_at < now() - make_interval(secs => %(lease_seconds)s)
+   AND attempts >= %(max_attempts)s
+RETURNING id
+"""
+
+SQL_PRUNE_ADDRESS_REQUESTS = """
+DELETE FROM address_lifecycle_requests
+ WHERE status IN ('done', 'failed')
+   AND completed_at < now() - make_interval(secs => %(retention_seconds)s)
+"""
+
+#: The transport's own refusal. Distinct from the two above because the advice
+#: is different again: nothing is owed to a buyer here, and the operator reading
+#: it needs to know that the *pool* is the thing that stopped refilling.
+ADDRESS_REQUEST_ABANDONED_ERROR_CODE = "AddressLifecycleAbandoned"
+ADDRESS_REQUEST_ABANDONED_MESSAGE = (
+    "the deriver could not apply this address transition within its attempt "
+    "budget; the address stays where it is and the settler will ask again"
+)
+
+
+def listen_for_address_lifecycle(conn: psycopg.Connection[Any]) -> None:
+    """Subscribe this connection to the address-lifecycle channel. Autocommit."""
+    if not conn.autocommit:
+        raise ValueError(
+            "the listening connection must be autocommit; notifications are not "
+            "delivered while a transaction is open"
+        )
+    conn.execute(f"LISTEN {CHANNEL_ADDRESS_LIFECYCLE}")
+
+
+def claim_next_address_request(
+    conn: psycopg.Connection[Any], *, exclude: Sequence[uuid.UUID] = ()
+) -> AddressLifecycleRequest | None:
+    """Take the oldest pending lifecycle request, marking it ``processing``."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(SQL_CLAIM_NEXT_ADDRESS_REQUEST, {"exclude": list(exclude)})
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return AddressLifecycleRequest(
+        request_id=row["id"],
+        address_id=int(row["address_id"]),
+        invoice_id=row["invoice_id"],
+        action=row["action"],
+        cooldown_until=row["cooldown_until"],
+        attempts=int(row["attempts"]),
+        requested_at=row["requested_at"],
+    )
+
+
+def complete_address_request(
+    conn: psycopg.Connection[Any], request_id: uuid.UUID
+) -> bool:
+    """Mark the request done. Call inside the transaction that did the work.
+
+    ``False`` means the lease expired and another pass owns the row now, in
+    which case the caller rolls back. Rolling back an address transition is
+    cheap and safe: the settler's next sweep sees the same unchanged row and
+    asks again.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(SQL_COMPLETE_ADDRESS_REQUEST, {"request_id": request_id})
+        return cur.fetchone() is not None
+
+
+def refuse_address_request(
+    conn: psycopg.Connection[Any],
+    request_id: uuid.UUID,
+    *,
+    error_code: str,
+    error_message: str,
+) -> bool:
+    """Record a final refusal. Call in a fresh transaction after a rollback."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            SQL_REFUSE_ADDRESS_REQUEST,
+            {
+                "request_id": request_id,
+                "error_code": error_code,
+                "error_message": error_message,
+            },
+        )
+        return cur.fetchone() is not None
+
+
+def requeue_address_request(
+    conn: psycopg.Connection[Any],
+    request_id: uuid.UUID,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> bool:
+    """Put an unexpectedly failed request back. ``False`` once the budget is out."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            SQL_REQUEUE_ADDRESS_REQUEST,
+            {"request_id": request_id, "max_attempts": max_attempts},
+        )
+        return cur.fetchone() is not None
+
+
+def reclaim_stale_address_requests(
+    conn: psycopg.Connection[Any],
+    *,
+    lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> tuple[int, int]:
+    """Lease sweep for the lifecycle queue. Returns ``(requeued, abandoned)``."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            SQL_RECLAIM_STALE_ADDRESS_REQUESTS,
+            {"lease_seconds": lease_seconds, "max_attempts": max_attempts},
+        )
+        requeued = len(cur.fetchall())
+        cur.execute(
+            SQL_ABANDON_STALE_ADDRESS_REQUESTS,
+            {
+                "lease_seconds": lease_seconds,
+                "max_attempts": max_attempts,
+                "error_code": ADDRESS_REQUEST_ABANDONED_ERROR_CODE,
+                "error_message": ADDRESS_REQUEST_ABANDONED_MESSAGE,
+            },
+        )
+        abandoned = len(cur.fetchall())
+    if requeued or abandoned:
+        log.warning(
+            "reclaimed %d stale address request(s), abandoned %d past %d attempt(s)",
+            requeued,
+            abandoned,
+            max_attempts,
+        )
+    return requeued, abandoned
+
+
+def prune_completed_address_requests(
+    conn: psycopg.Connection[Any],
+    *,
+    retention_seconds: float = DEFAULT_RETENTION_SECONDS,
+) -> int:
+    """Delete finished lifecycle rows past their retention. Returns how many."""
+    with conn.cursor() as cur:
+        cur.execute(SQL_PRUNE_ADDRESS_REQUESTS, {"retention_seconds": retention_seconds})
+        return cur.rowcount
+
+
+def drain_address_requests(
+    conn: psycopg.Connection[Any],
+) -> Iterator[AddressLifecycleRequest]:
+    """Yield claimed lifecycle requests until the queue is empty."""
+    attempted: list[uuid.UUID] = []
+    while True:
+        request = claim_next_address_request(conn, exclude=attempted)
         if request is None:
             conn.rollback()
             return
