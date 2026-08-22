@@ -37,6 +37,7 @@ a standing requirement in this repo (TZ 5.8/T2.4), not an optional extra.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import sys
@@ -74,6 +75,16 @@ _DATA_TABLES = (
     "assets",
     "chains",
 )
+
+
+def _evm_address(label: int) -> str:
+    """A deterministic, ``address_format``-CHECK-satisfying value from an int.
+
+    Same construction as ``core.invoicing.tests.conftest._address``: a hash
+    rather than an incrementing counter formatted into hex, so two labels never
+    collide and the result always has the full 40 hex digits ``0x...`` requires.
+    """
+    return "0x" + hashlib.sha256(str(label).encode()).hexdigest()[:40]
 
 
 def database_url() -> str:
@@ -171,6 +182,113 @@ class Outbox:
                 {"tg_id": tg_id if tg_id is not None else 500_000 + n, "blocked": blocked},
             )
             return int(row.scalar_one())
+
+    async def invoice(self, *, address: str | None = None) -> tuple[str, str]:
+        """One invoice with a real ``receive_addresses`` row behind it.
+
+        For :mod:`notifier.tests.test_address_verification` (S-C3): that suite
+        needs a ledger to check ``payload["address"]`` against, not a working
+        ``/buy`` — so this goes straight through raw SQL rather than
+        ``core.invoicing.service.create_invoice`` (which has its own
+        issuance-focused suite in ``core/invoicing/tests``) and skips the
+        pool/quota machinery entirely. It still satisfies every CHECK and FK
+        the schema has, because a row that failed to insert would not test
+        anything.
+
+        Returns ``(invoice_id, address)`` as plain strings — the same shape
+        the notifier sees ``ref_id`` and ``payload['address']`` in.
+        """
+        n = self._next()
+        addr = address if address is not None else _evm_address(n)
+        chain_id = 900_000 + n
+        invoice_id = uuid.uuid4()
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO chains (chain_id, name, rpc_urls, min_confirmations) "
+                    "VALUES (:chain_id, :name, '{}', 3)"
+                ),
+                {"chain_id": chain_id, "name": f"chain-{n}"},
+            )
+            asset_id = (
+                await conn.execute(
+                    sa.text(
+                        "INSERT INTO assets (chain_id, contract_address, symbol, decimals, "
+                        "                    is_native, is_enabled) "
+                        "VALUES (:chain_id, :contract, 'USDC', 6, false, true) "
+                        "RETURNING id"
+                    ),
+                    {"chain_id": chain_id, "contract": _evm_address(100_000 + n)},
+                )
+            ).scalar_one()
+            product_id = (
+                await conn.execute(
+                    sa.text(
+                        "INSERT INTO products (sku, title, price_usd, kind, content_ref, active) "
+                        "VALUES (:sku, 'p', 10.00, 'one_off', 'file', true) "
+                        "RETURNING id"
+                    ),
+                    {"sku": f"sku-{n}"},
+                )
+            ).scalar_one()
+            user_row = await conn.execute(
+                sa.text("INSERT INTO users (tg_id, lang) VALUES (:tg_id, 'en') RETURNING id"),
+                {"tg_id": 700_000 + n},
+            )
+            user_id = user_row.scalar_one()
+            hd_account_id = (
+                await conn.execute(
+                    sa.text(
+                        "INSERT INTO hd_accounts (label, xpub_fingerprint, path_prefix) "
+                        "VALUES ('test', 'deadbeef', :prefix) "
+                        "RETURNING id"
+                    ),
+                    # A single literal `'` per segment (BIP32 hardened-derivation
+                    # notation), not two: `''` only means one `'` when it appears
+                    # inside a SQL *literal*, as it does in
+                    # core/invoicing/tests/conftest.py's inline
+                    # `'m/44''/60''/0'''`. This value travels as a bound
+                    # parameter instead, so it is written the way it must
+                    # actually be stored.
+                    {"prefix": f"m/44'/60'/{n}'"},
+                )
+            ).scalar_one()
+            address_id = (
+                await conn.execute(
+                    sa.text(
+                        "INSERT INTO receive_addresses (hd_account_id, derivation_index, address) "
+                        "VALUES (:hd, 0, :addr) "
+                        "RETURNING id"
+                    ),
+                    {"hd": hd_account_id, "addr": addr},
+                )
+            ).scalar_one()
+            await conn.execute(
+                sa.text(
+                    """
+                    INSERT INTO invoices
+                           (id, user_id, product_id, chain_id, asset_id, address_id,
+                            amount_due_raw, amount_due_usd, rate_snapshot, rate_locked_until,
+                            expires_at, topup_window_until, integrity_mac, public_token,
+                            policy_version)
+                    VALUES (:id, :user_id, :product_id, :chain_id, :asset_id, :address_id,
+                            1000000, 10.00, 1.0,
+                            now() + interval '1 hour', now() + interval '1 hour',
+                            now() + interval '2 hour', :mac, :token, 'v1')
+                    """
+                ),
+                {
+                    "id": invoice_id,
+                    "user_id": user_id,
+                    "product_id": product_id,
+                    "chain_id": chain_id,
+                    "asset_id": asset_id,
+                    "address_id": address_id,
+                    "mac": b"\x00" * 32,
+                    "token": f"tok-{n}-{uuid.uuid4().hex}",
+                },
+            )
+        return str(invoice_id), addr
 
     async def enqueue(
         self,

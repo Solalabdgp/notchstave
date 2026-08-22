@@ -10,7 +10,9 @@ table                privilege                   what it is for
 ``users``            ``SELECT``,                 chat id and language;
                      ``UPDATE (bot_blocked_at)`` mark a user who blocked the bot
 ``audit_log``        ``SELECT, INSERT``          append-only trail
-``invoices`` etc.    ``SELECT``                  reference data only
+``invoices``         ``SELECT``                  reference data, and the S-C3
+                                                  address check below
+``receive_addresses````SELECT``                  the S-C3 address check below
 ===================  ==========================  ================================
 
 Two consequences worth stating before someone tries to work around them:
@@ -25,6 +27,35 @@ Two consequences worth stating before someone tries to work around them:
   ids alone. This is the privilege boundary showing up as an API constraint,
   and it is the right way round: the process that talks to the internet cannot
   read the catalogue.
+
+**S-C3.** The absence of INSERT on ``notifications`` above was, until migration
+0010, a privilege the notifier held and every *other* internet-facing role
+except one (``notchstave_bot``, which legitimately enqueues ``admin_action``
+rows — see ``bot/main.py`` and Phase-1 finding H1) did not: ``notchstave_api``
+held ``SELECT, INSERT`` on this table and used neither, which meant a
+compromised ``api`` process — the one process with no code path that should
+ever touch the outbox at all — could INSERT a row shaped like a legitimate
+underpayment notice, carrying an attacker's own address in ``payload_json``,
+and this process would have rendered and sent it verbatim (``notifier/render.py
+:_invoice_underpaid``). Migration 0010 revokes that grant, which is the
+necessary fix. This module carries the *sufficient* one, because the
+underlying weakness is not "one grant was too wide" but "the outbox trusts its
+own payload" — and a table's grants are only ever as trustworthy as the last
+audit of them.
+
+:func:`canonical_invoice_address` is that second layer. For the one renderer
+that names an address the buyer is told to pay or top up
+(``invoice_underpaid``), :mod:`notifier.service` checks ``payload["address"]``
+against ``invoices.address_id -> receive_addresses.address`` — the row only
+``notchstave_deriver`` may write (T1.2) — before sending, and refuses to send
+on any mismatch. This is the notifier-side instance of the check
+``core.metrics`` already names as one of T1.1's three observation points:
+*"перед отправкой сообщения с адресом, при рендере страницы инвойса, при
+зачёте в settler"*. The second of those three is ``core.invoicing.service
+.verify_invoice_address``, used by ``api``/``bot``; this is the first, and
+until now it did not exist. Nothing new was granted to build it — ``invoices``
+and ``receive_addresses`` were both already ``SELECT`` for the notifier in
+migration 0002.
 
 **On claiming.** ``notification_status`` has four values — ``queued``, ``sent``,
 ``failed``, ``dead`` — and no ``sending``. Rather than add one, a claimed row is
@@ -63,6 +94,7 @@ __all__ = [
     "dlq_size",
     "find_message_id",
     "record_audit",
+    "canonical_invoice_address",
 ]
 
 
@@ -374,3 +406,44 @@ async def record_audit(
             "args": json.dumps(args, default=str, sort_keys=True),
         },
     )
+
+
+#: S-C3's second layer. The ground truth for "what address is this invoice's",
+#: independent of anything a settler-written (or, before migration 0010, a
+#: forged) ``notifications.payload_json`` claims. ``receive_addresses.address``
+#: is writable only by ``notchstave_deriver`` (migration 0002, TZ 5.8/T1.2), so
+#: this join answers the question without needing the xpub or
+#: ``INVOICE_INTEGRITY_KEY`` — neither of which this process holds, and neither
+#: of which migration 0010's fix requires it to start holding.
+SQL_CANONICAL_ADDRESS = sa.text(
+    """
+    SELECT ra.address
+      FROM invoices i
+      JOIN receive_addresses ra ON ra.id = i.address_id
+     WHERE i.id = CAST(:invoice_id AS uuid)
+    """
+)
+
+
+async def canonical_invoice_address(conn: AsyncConnection, invoice_id: str) -> str | None:
+    """The address ``invoices.address_id`` actually names, or ``None``.
+
+    ``None`` covers two cases the caller must treat identically: the invoice
+    does not exist, and (structurally impossible under the schema's FKs, but
+    not a reason to assume it) it exists with no resolvable address. Either way
+    there is no ledger value to compare against, so
+    :meth:`notifier.service.Notifier._address_mismatch` fails closed rather
+    than sending on the strength of an unverifiable claim.
+
+    ``invoice_id`` is a ``str`` rather than a ``uuid.UUID`` because it travels
+    as ``notifications.ref_id`` (``VARCHAR(64)``, migration 0001) — a column a
+    forged row controls completely, so nothing here should assume it parses.
+    The caller (:meth:`notifier.service.Notifier._address_mismatch`) validates
+    it with ``uuid.UUID(...)`` *before* calling this function and treats a
+    ``ValueError`` there as its own mismatch; this function's ``CAST`` is a
+    second, cheap backstop for the same malformed-input case, not the primary
+    guard against it.
+    """
+    result = await conn.execute(SQL_CANONICAL_ADDRESS, {"invoice_id": invoice_id})
+    row = result.first()
+    return None if row is None else str(row[0])

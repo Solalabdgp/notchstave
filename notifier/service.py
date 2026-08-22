@@ -48,11 +48,13 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from core.metrics import address_mismatch_total
 from notifier import backoff, metrics, render, repository
 from notifier.config import NotifierConfig
 from notifier.errors import (
@@ -78,6 +80,17 @@ SENT: Disposition = "sent"
 RETRY: Disposition = "retry"
 DEAD: Disposition = "dead"
 STALE: Disposition = "stale"
+
+#: Kinds whose rendered text names a receive address the buyer is told to pay
+#: or top up (S-C3). ``notifier/render.py`` is the exhaustive source of truth —
+#: grep it for ``payload['address']`` before adding to or trusting this set —
+#: and today it is exactly the underpayment notice: "Send the remainder to the
+#: same address: {payload['address']}". ``payment_seen`` and the settlement/
+#: revocation/refund kinds never render an address at all, so there is nothing
+#: for a forged payload to substitute there; narrowing the check to the kinds
+#: that actually display one is what keeps this a targeted fix for S-C3 rather
+#: than a blanket distrust of every outbox row.
+ADDRESS_SENSITIVE_KINDS = frozenset({"invoice_underpaid"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +166,11 @@ class Notifier:
         except PermanentDeliveryError as exc:
             return await self._retire(row, reason="no_renderer", error=str(exc))
 
+        if row.kind in ADDRESS_SENSITIVE_KINDS:
+            mismatch = await self._address_mismatch(row)
+            if mismatch is not None:
+                return await self._retire_address_mismatch(row, detail=mismatch)
+
         edits_message_id: int | None = None
         if rendered.edits_kind is not None:
             async with self._engine.connect() as conn:
@@ -205,6 +223,78 @@ class Notifier:
         metrics.NOTIFICATIONS_SENT.labels(kind=row.kind).inc()
         metrics.DELIVERY_SECONDS.observe(max(0.0, _age_seconds(row)))
         return SENT
+
+    # -- S-C3: does the payload's address survive a look at the ledger? ---
+
+    async def _address_mismatch(self, row: ClaimedNotification) -> str | None:
+        """``None`` if ``payload["address"]`` matches the ledger; a reason if not.
+
+        Fails closed on every ambiguous case, not only the clean mismatch:
+
+        * ``payload["address"]`` missing or not a string — the row already
+          passed :func:`notifier.render.render`, which requires the key for
+          this kind, so this only fires if a payload carries a non-string
+          value under it (``KeyError`` there does not catch that).
+        * ``ref_id`` is not a well-formed invoice UUID — a row this process did
+          not write cannot be assumed to carry one.
+        * the invoice does not resolve to a receive address at all —
+          :func:`notifier.repository.canonical_invoice_address` returning
+          ``None``.
+
+        Every one of these is "cannot prove this address is real", and TZ 5.3's
+        rule — no address reaches a human without a check — treats "cannot
+        prove" the same as "proved wrong". A row that fails here is not sent;
+        see :meth:`_retire_address_mismatch`.
+        """
+        claimed = row.payload.get("address")
+        if not isinstance(claimed, str) or not claimed:
+            return "payload carries no usable 'address' to verify"
+
+        try:
+            invoice_id = uuid.UUID(row.ref_id)
+        except ValueError:
+            return f"ref_id {row.ref_id!r} is not a UUID invoice id"
+
+        async with self._engine.connect() as conn:
+            canonical = await repository.canonical_invoice_address(conn, str(invoice_id))
+
+        if canonical is None:
+            return f"invoice {invoice_id} has no resolvable receive address on the ledger"
+        if canonical != claimed:
+            return (
+                f"payload address {claimed!r} does not match the ledger address "
+                f"{canonical!r} for invoice {invoice_id}"
+            )
+        return None
+
+    async def _retire_address_mismatch(
+        self, row: ClaimedNotification, *, detail: str
+    ) -> Disposition:
+        """S-C3's DLQ path: everything :meth:`_retire` does, plus the T1 alarm.
+
+        ``_retire`` already writes the DLQ row and an ``audit_log`` entry
+        carrying ``reason`` and ``error`` — both set to name this case
+        explicitly, so the record a human reads is not merely "delivery
+        failed" but "this payload did not match the ledger, suspected
+        compromise". What this adds on top is
+        :data:`core.metrics.address_mismatch_total`: the cross-process T1.1
+        counter whose own docstring names *"перед отправкой сообщения с
+        адресом"* as one of its three intended observation points, and which
+        nothing implemented at that point until now — the other two
+        (``core.invoicing.service.verify_invoice_address`` for the api/bot
+        display path, and issuance itself) already increment it.
+        """
+        address_mismatch_total.inc()
+        log.error(
+            "notification %s (%s): address mismatch, suspected payload tampering "
+            "(S-C3) — %s",
+            row.id,
+            row.kind,
+            detail,
+        )
+        return await self._retire(
+            row, reason="address_mismatch", error=f"suspected compromise (S-C3): {detail}"
+        )
 
     # -- outcomes ----------------------------------------------------------
 

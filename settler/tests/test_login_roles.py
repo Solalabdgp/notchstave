@@ -141,6 +141,40 @@ DENIED: tuple[tuple[str, str, str], ...] = (
         "another person without touching entitlements",
     ),
     ("deriver", "UPDATE users SET lang = 'ru'", "0006 grants the deriver SELECT, not UPDATE"),
+    # --- api holds nothing it does not use (0010, S-C3 / Phase-1 M1) ---------
+    #
+    # api performs zero writes in its own process (api.deps.ApiDependencies
+    # exposes only .read()); 0002 nonetheless gave it INSERT/UPDATE on four
+    # tables it never touches. The most consequential of the four is
+    # `notifications`: an api INSERT there is an attacker-controlled outbox row
+    # that the notifier would render and send as a legitimate system message —
+    # S-C3, live under a fully-enforced role matrix and independent of C1.
+    (
+        "api",
+        "INSERT INTO notifications (user_id, kind, ref_id, dedup_key, payload_json) "
+        "VALUES (1, 'invoice_underpaid', 'x', 'x', '{}'::jsonb)",
+        "0010 / S-C3 — the outbox belongs to whoever made the money decision, "
+        "and api makes none",
+    ),
+    ("api", "SELECT * FROM notifications", "0010 — api never reads the outbox either"),
+    (
+        "api",
+        "INSERT INTO users (tg_id) VALUES (999999999)",
+        "0010 / Phase-1 M1 — api never creates a user; the bot does, on /start",
+    ),
+    ("api", "UPDATE users SET lang = 'ru'", "0010 / Phase-1 M1 — api never touches users"),
+    (
+        "api",
+        "INSERT INTO rate_limits (user_id, window_start) VALUES (1, now())",
+        "0010 / Phase-1 M1 — no quota-display feature reads or writes this "
+        "table from api",
+    ),
+    (
+        "api",
+        "INSERT INTO audit_log (actor_kind, actor_id, action, target_kind, target_id) "
+        "VALUES ('system', 'api', 'x', 'x', 'x')",
+        "0010 / Phase-1 M1 — api logs failures through logging, not audit_log",
+    ),
 )
 
 #: One read per role that its grants must allow. Sufficiency in depth belongs to
