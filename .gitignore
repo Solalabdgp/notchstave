@@ -39,3 +39,4 @@ Thumbs.db
 *.log
 receipts/
 review-receipts/
+.full-review/
